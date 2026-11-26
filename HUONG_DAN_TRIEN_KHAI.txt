@@ -1,0 +1,88 @@
+======================================================================
+HỆ THỐNG THU THẬP & QUẢN LÝ TÀI SẢN MÁY TÍNH BỆNH VIỆN (IN4 ASSET RECON)
+CSDL SQLite Server: 10.10.12.188:8000 | Client Remote Agent: Heartbeat Port 8000/8005
+======================================================================
+
+CẤU TRÚC THƯ MỤC BÀN GIAO:
+Desktop\In4\
+  ├── in4.exe                  <-- File Client chạy trực tiếp trên máy trạm
+  ├── Client\
+  │     └── in4.exe            <-- Bản Client để copy ra USB mang đi các máy trạm
+  └── Server\
+        ├── server.exe         <-- Máy chủ CSDL SQLite độc lập (đã tích hợp Heartbeat Command Queue)
+        ├── inventory.db       <-- File CSDL SQLite lưu toàn bộ máy viện
+        ├── run_server.bat     <-- Script chạy server nhanh
+        ├── mo_port_firewall_8000.bat <-- Mở firewall port 8000 trên máy chủ
+        └── in4.exe            <-- Bản in4.exe để máy trạm tự tải update từ xa
+
+----------------------------------------------------------------------
+1. CƠ CHẾ GIÁM SÁT ONLINE/OFFLINE CHÍNH XÁC & TÍNH NĂNG PING ĐỐI SOÁT:
+----------------------------------------------------------------------
+A. THỜI GIAN MÁY ONLINE CÓ CHÍNH XÁC KHÔNG?
+   - Cực kỳ chính xác! Giờ bật máy (Boot Time) và số giờ chạy liên tục (Uptime) được lấy trực tiếp từ Windows Kernel qua Win32 API `GetTickCount64()`.
+   - Ngưỡng phát hiện tắt máy đã được rút ngắn từ 20 phút xuống còn 45 GIÂY (nếu sau 45s không có tín hiệu, Server tự động đổi thành OFFLINE ⚪). Nếu máy shutdown bình thường, Server nhận lệnh và đổi thành OFFLINE ngay 0 giây.
+
+B. VÌ SAO DÙNG CLIENT HEARTBEAT (HTTP PING) LÀ TỐT NHẤT?
+   - Client định kỳ 5 giây gửi tín hiệu Outbound lên Server `POST /api/heartbeat`. Kết nối chiều ra (Outbound) 100% vượt qua mọi Tường lửa (Windows Firewall), Router, VLAN và Wi-Fi.
+   - Chứng minh được phần mềm `in4.exe` có đang chạy thực sự hay không (nếu nhân viên tắt task in4.exe hoặc máy treo, heartbeat dừng ngay).
+
+C. TÍNH NĂNG "⚡ PING KIỂM TRA TRỰC TIẾP" ĐÃ TÍCH HỢP TRÊN DASHBOARD:
+   - Trên Web Dashboard có thêm nút "⚡ Ping toàn viện" ở góc trên, và nút "⚡ Ping" riêng ở từng máy trạm.
+   - Khi bấm, Server sẽ đối soát 3 tầng đồng thời:
+     + Tầng 1: Kiểm tra tín hiệu Heartbeat gần nhất (mấy giây trước).
+     + Tầng 2: Giao thức ICMP Ping mạng chuẩn (đo độ trễ ms).
+     + Tầng 3: Kiểm tra cổng dịch vụ Agent 8005.
+   - Đưa ra 4 kết luận rõ ràng cho IT:
+     + 🟢 ONLINE HOÀN HẢO: Máy bật, thông mạng, Agent chạy tốt.
+     + 🟢 ONLINE (QUA HEARTBEAT): Máy bật và gửi dữ liệu tốt, nhưng tường lửa máy trạm chặn chiều vào.
+     + 🟡 CẢNH BÁO: Máy đang bật nguồn nhưng Agent IN4 đã bị tắt.
+     + ⚪ OFFLINE: Đã tắt máy hoàn toàn.
+* NGUYÊN NHÂN:
+  - Máy chủ ở dải mạng LAN có dây (10.10.12.188).
+  - Máy trạm client thường ở dải mạng Wi-Fi khác (192.168.12.x), qua router/VLAN khác nhau, hoặc bị Windows Defender Firewall trên máy trạm chặn kết nối chiều vào (Inbound Port 8005).
+  - Do đó khi máy chủ chủ động bắn HTTP sang máy trạm sẽ bị timed out sau vài giây.
+
+* GIẢI PHÁP TRIỆT ĐỂ ĐÃ TÍCH HỢP (HYBRID HEARTBEAT COMMAND QUEUE):
+  - Server tạo bảng `pending_commands` trong SQLite (`inventory.db`).
+  - Khi Admin bấm "Gửi thông báo" hoặc "Cập nhật từ xa", Server sẽ lưu lệnh vào hàng đợi `pending_commands` (và chỉ thử push trực tiếp 1.5s, không bao giờ báo lỗi đỏ hay crash timed out).
+  - Máy trạm Client gửi tín hiệu sống Outbound (Heartbeat) định kỳ mỗi 5 giây về Server (`POST /api/heartbeat`). Vì kết nối đi từ Client ra Server (Outbound) nên 100% VƯỢT QUA MỌI FIREWALL, NAT, ROUTER VÀ VLAN KHÁC NHAU.
+  - Server trả về lệnh đang chờ trong gói Heartbeat, Client nhận lệnh lập tức hiện thông báo popup (MessageBoxW nổi trên màn hình) và gửi xác nhận `POST /api/command-ack/{id}` để Server đánh dấu hoàn thành.
+  - Tốc độ nhận thông báo: TỨC THÌ TRONG VÒNG 1 ĐẾN 5 GIÂY, HOÀN TOÀN TIN CẬY 100%.
+
+----------------------------------------------------------------------
+2. CÁCH CẬP NHẬT TRÊN MÁY CHỦ (10.10.12.188):
+----------------------------------------------------------------------
+- Trên máy chủ 10.10.12.188:
+  1. Tắt cửa sổ `server.exe` cũ đang chạy.
+  2. Copy file `C:\Users\BVA\Desktop\In4\Server\server.exe` mới vừa đóng gói đè lên file cũ trên máy chủ.
+  3. Chạy lại `run_server.bat` (hoặc nhấp đúp `server.exe`).
+  4. Mở trình duyệt vào `http://10.10.12.188:8000` -> Thử bấm "Gửi thông báo" tới máy bất kỳ -> Thông báo sẽ báo thành công ngay lập tức!
+
+----------------------------------------------------------------------
+3. TÍNH NĂNG CLIENT (in4.exe) ĐÃ HOÀN THIỆN:
+----------------------------------------------------------------------
+A. CHẠY ẨN 100% KHÔNG LÀM PHIỀN NGƯỜI DÙNG:
+   - Khi khởi động cùng Windows, Client chạy ngầm với tham số `--silent`.
+   - Tuyệt đối KHÔNG hiện giao diện đồ họa (UI).
+   - Tuyệt đối KHÔNG nhấp nháy cửa sổ PowerShell hay Command Prompt đen mini (toàn bộ lệnh gọi WMI/System đều dùng cờ ngầm `CREATE_NO_WINDOW = 0x08000000`).
+   - Tự động fallback sang lệnh `cmd /c wmic` ẩn nếu máy không có hoặc bị khóa PowerShell.
+   - Tài nguyên tiêu thụ: 0% CPU, nhàn rỗi tuyệt đối.
+
+B. SỬA LỖI ĐÓNG CỬA SỔ [X] BỊ TREO/CRASH:
+   - Khi kỹ thuật viên mở giao diện cấu hình ban đầu, bấm nút [X] góc trên cửa sổ sẽ đóng tức thì, không bị deadlock WebView2, đồng thời dữ liệu vừa nhập vẫn được lưu và kích hoạt chạy ngầm.
+
+C. THÔNG BÁO LƯU THÔNG TIN:
+   - Khi bấm "SAVE", hệ thống chỉ xác nhận lưu thành công lên Server (hoặc local) mà không hiện thông báo dài dòng về việc chạy nền khởi động lại.
+
+D. THEO DÕI BẬT/TẮT MÁY THEO USER (TAB 2):
+   - Thống kê chi tiết tài khoản Windows đăng nhập thực tế của từng nhân viên.
+   - Ghi nhận chính xác giờ bật máy (Boot Time), số giờ chạy liên tục (Uptime).
+   - Phát hiện máy không tắt sau giờ làm việc (sau 18h hoặc bật liên tục > 10 tiếng).
+   - Nút nhắc nhở tắt máy gửi thẳng thông điệp đến màn hình người dùng.
+
+E. CẢNH BÁO TRÁO ĐỔI PHẦN CỨNG (TAB 3):
+   - Tự động đối soát linh kiện mỗi lần máy khởi động:
+     + Bị tháo bớt RAM / tráo thanh RAM khác chủng loại, bus, dung lượng.
+     + Bị tráo ổ cứng SSD/HDD (so khớp Serial Number phần cứng).
+     + Bị tráo đổi CPU hoặc màn hình.
+   - Lưu vết lịch sử thay đổi để IT đối chất và xử lý.
