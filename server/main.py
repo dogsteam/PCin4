@@ -17,7 +17,7 @@ if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
         sys.stderr.reconfigure(encoding='utf-8', errors='replace')
     except Exception:
         pass
-from typing import Optional
+from typing import List, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, Response, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -2106,4 +2106,20 @@ if __name__ == "__main__":
     import threading
     threading.Thread(target=_background_probe_loop, daemon=True).start()
 
-    uvicorn.run(app, host=args.host, port=args.port)
+    try:
+        uvicorn.run(app, host=args.host, port=args.port)
+    except Exception as srv_err:
+        import traceback
+        from datetime import datetime
+        err_text = traceback.format_exc()
+        try:
+            with open(os.path.join(BASE_DIR, "server_error.log"), "a", encoding="utf-8") as f:
+                f.write(f"\n[{datetime.now()}] {err_text}\n")
+        except Exception:
+            pass
+        print(f"\n[LOI KHOI DONG SERVER]: {srv_err}\n{err_text}")
+        if not args.no_browser:
+            try:
+                input("Nhan Enter de thoat...")
+            except Exception:
+                pass
