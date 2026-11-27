@@ -37,6 +37,33 @@ CLIENT_VERSION = "1.3.1"
 DEFAULT_HEARTBEAT_INTERVAL = 300  # 5 phút/lần (tối ưu cho quy mô 800 máy)
 
 _MUTEX_HANDLE = None
+_STOPPED_OLD_AGENT_THIS_SESSION = False
+
+
+def stop_other_agent_processes():
+    """Dừng các tiến trình in4.exe cũ đang chạy ngầm trong IN4_Agent (trừ tiến trình GUI hiện tại) để tránh xung đột Mutex/Port 8005."""
+    global _STOPPED_OLD_AGENT_THIS_SESSION
+    if _STOPPED_OLD_AGENT_THIS_SESSION or sys.platform != "win32":
+        return
+    _STOPPED_OLD_AGENT_THIS_SESSION = True
+    try:
+        my_pid = os.getpid()
+        ps_cmd = (
+            f"Get-CimInstance Win32_Process -Filter \"Name='in4.exe'\" | "
+            f"Where-Object {{ $_.ProcessId -ne {my_pid} -and $_.ExecutablePath -like '*IN4_Agent*' }} | "
+            f"ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
+        )
+        CREATE_NO_WINDOW = 0x08000000
+        subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            creationflags=CREATE_NO_WINDOW
+        )
+        time.sleep(0.8)
+    except Exception:
+        pass
 
 
 def log_sync(msg: str):
@@ -321,8 +348,9 @@ def install_auto_start(metadata: dict = None) -> bool:
         agent_dir = get_agent_dir()
         target_exe = os.path.join(agent_dir, "in4.exe")
 
-        # 0. Thêm Exclusion trước khi copy exe vào thư mục Agent
+        # 0. Thêm Exclusion & dừng bản agent cũ (nếu đang chạy ngầm) để không xung đột Mutex / Port 8005
         ensure_defender_exclusion(agent_dir)
+        stop_other_agent_processes()
 
         # 1. Sao chép in4.exe vào thư mục cố định
         current_exe = os.path.abspath(sys.executable if is_packaged_exe() else __file__)
