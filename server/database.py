@@ -123,7 +123,11 @@ def init_db():
         ("hardware_tampered", "INTEGER DEFAULT 0"),
         ("tamper_details", "TEXT"),
         ("client_agent_port", "INTEGER DEFAULT 8005"),
-        ("client_version", "TEXT DEFAULT '1.3.0'")
+        ("client_version", "TEXT DEFAULT '1.3.0'"),
+        ("ping_ok", "INTEGER DEFAULT 0"),
+        ("port_ok", "INTEGER DEFAULT 0"),
+        ("agent_health", "TEXT DEFAULT 'ONLINE'"),
+        ("last_probe_at", "TIMESTAMP")
     ]
     for col, ctype in migrations:
         try:
@@ -331,7 +335,7 @@ def format_relative_time(dt_str: Optional[str]) -> str:
 
 def get_all_computers(search: Optional[str] = None, department: Optional[str] = None) -> List[Dict[str, Any]]:
     # Tự động cập nhật trạng thái online trước khi truy vấn (ngưỡng 45 giây)
-    update_online_status_threshold(45)
+    update_online_status_threshold()
 
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -394,7 +398,7 @@ def get_departments() -> List[str]:
 
 
 def get_statistics() -> Dict[str, Any]:
-    update_online_status_threshold(45)
+    update_online_status_threshold()
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -403,6 +407,12 @@ def get_statistics() -> Dict[str, Any]:
 
     cursor.execute("SELECT COUNT(*) AS online_pcs FROM computers WHERE is_online = 1")
     online_pcs = cursor.fetchone()["online_pcs"]
+
+    cursor.execute("SELECT COUNT(*) AS suspect_av_pcs FROM computers WHERE agent_health = 'NO_AGENT_SUSPECT_AV'")
+    suspect_av_pcs = cursor.fetchone()["suspect_av_pcs"]
+
+    cursor.execute("SELECT COUNT(*) AS offline_pcs FROM computers WHERE is_online = 0")
+    offline_pcs = cursor.fetchone()["offline_pcs"]
 
     cursor.execute("SELECT COUNT(*) AS low_ram FROM computers WHERE ram_total_gb > 0 AND ram_total_gb <= 4.0")
     low_ram = cursor.fetchone()["low_ram"]
@@ -486,6 +496,8 @@ def get_statistics() -> Dict[str, Any]:
     return {
         "total_pcs": total,
         "online_pcs": online_pcs,
+        "suspect_av_pcs": suspect_av_pcs,
+        "offline_pcs": offline_pcs,
         "ssd_pcs": ssd_pcs,
         "low_ram_pcs": low_ram,
         "hdd_only_pcs": hdd_only,
@@ -517,6 +529,8 @@ def record_heartbeat(mac_address: str, ip_address: str, logged_in_user: str = ""
     UPDATE computers SET 
         last_seen = :now_str,
         is_online = 1,
+        agent_health = 'ONLINE',
+        port_ok = 1,
         ip_address = COALESCE(NULLIF(:ip_address, ''), ip_address),
         logged_in_user = COALESCE(NULLIF(:logged_in_user, ''), logged_in_user),
         boot_time = COALESCE(NULLIF(:boot_time, ''), boot_time)
@@ -580,15 +594,51 @@ def record_power_event(mac_address: str, event_type: str, logged_in_user: str = 
 
 
 def update_online_status_threshold(timeout_seconds: int = 720):
-    """Tự động chuyển các máy không có tín hiệu trong 720 giây (12 phút) thành Offline (Đã tắt)."""
+    """Tự động chuyển các máy không có tín hiệu trong 720 giây (12 phút) thành Offline (hoặc chờ Probe đối soát)."""
     conn = get_db_connection()
     cursor = conn.cursor()
     cutoff = (datetime.now() - timedelta(seconds=timeout_seconds)).strftime("%Y-%m-%d %H:%M:%S")
     cursor.execute("""
     UPDATE computers 
-    SET is_online = 0 
+    SET is_online = 0,
+        agent_health = CASE WHEN agent_health = 'ONLINE' THEN 'OFFLINE' ELSE agent_health END
     WHERE (last_seen IS NULL OR last_seen < ?) AND is_online = 1
     """, (cutoff,))
+    conn.commit()
+    conn.close()
+
+
+def get_stale_computers_for_probe(timeout_seconds: int = 720) -> List[Dict[str, Any]]:
+    """Lấy danh sách các máy quá hạn Heartbeat để Server chủ động Ping & Check Port 8005."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cutoff = (datetime.now() - timedelta(seconds=timeout_seconds)).strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute("""
+    SELECT mac_address, ip_address, hostname, client_agent_port, last_seen
+    FROM computers
+    WHERE last_seen IS NULL OR last_seen < ?
+    """, (cutoff,))
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def update_probe_result(mac_address: str, is_online: int, ping_ok: int, port_ok: int, agent_health: str):
+    """Lưu kết quả đối soát 2 chiều (Ping + Port 8005) vào DB."""
+    if not mac_address:
+        return
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute("""
+    UPDATE computers
+    SET is_online = ?,
+        ping_ok = ?,
+        port_ok = ?,
+        agent_health = ?,
+        last_probe_at = ?
+    WHERE mac_address = ?
+    """, (is_online, ping_ok, port_ok, agent_health, now_str, mac_address.upper()))
     conn.commit()
     conn.close()
 

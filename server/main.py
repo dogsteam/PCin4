@@ -408,8 +408,21 @@ def check_single_device_ping(mac: str, ip: str, port: int = 8005) -> dict:
         desc = "Cả ICMP Ping và Heartbeat đều không phản hồi. Máy tính đã tắt nguồn hoặc ngắt kết nối mạng hoàn toàn."
 
     is_online_final = 1 if (heartbeat_active or agent_port_active) else 0
+    if is_online_final:
+        db_health = "ONLINE"
+    elif icmp_success:
+        db_health = "NO_AGENT_SUSPECT_AV"
+    else:
+        db_health = "OFFLINE"
+
     if mac:
-        database.set_computer_online(mac, is_online_final)
+        database.update_probe_result(
+            mac,
+            is_online_final,
+            1 if icmp_success else 0,
+            1 if agent_port_active else 0,
+            db_health
+        )
 
     return {
         "status": "success",
@@ -915,16 +928,24 @@ def web_dashboard():
                 <div class="tab-pane fade" id="tab-list" role="tabpanel">
                     <div class="panel-box">
                         <div class="row g-2 mb-3 align-items-center">
-                            <div class="col-md-5">
+                            <div class="col-md-4">
                                 <div class="input-group">
                                     <span class="input-group-text bg-light border-end-0"><i class="bi bi-search text-muted"></i></span>
                                     <input type="text" id="search-input" class="form-control bg-light border-start-0" 
-                                        placeholder="🔍 Tìm nhanh: Mã vạch, Tên máy, IP, MAC, Bác sĩ, User Windows, Số phòng...">
+                                        placeholder="🔍 Tìm nhanh: Mã vạch, Tên máy, IP, MAC, Bác sĩ, User...">
                                 </div>
                             </div>
-                            <div class="col-md-4">
+                            <div class="col-md-3">
                                 <select id="dept-filter" class="form-select bg-light">
-                                    <option value="Tất cả">-- Tất cả Khoa / Phòng ban --</option>
+                                    <option value="Tất cả">-- Tất cả Khoa / Phòng --</option>
+                                </select>
+                            </div>
+                            <div class="col-md-2">
+                                <select id="health-filter" class="form-select bg-light">
+                                    <option value="ALL">-- Tất cả trạng thái --</option>
+                                    <option value="ONLINE">🟢 Client đang chạy</option>
+                                    <option value="NO_AGENT_SUSPECT_AV">⚠️ Bật máy, mất Client (Nghi AV)</option>
+                                    <option value="OFFLINE">⚫ Offline (Tắt máy)</option>
                                 </select>
                             </div>
                             <div class="col-md-3 text-end">
@@ -1074,7 +1095,10 @@ def web_dashboard():
                     document.getElementById('stat-dept').innerText = data.departments_count;
                     document.getElementById('dept-badge-count').innerText = `${data.departments_count} Khoa phòng`;
                     if (data.online_pcs !== undefined) {
-                        document.getElementById('stat-online').innerText = `${data.online_pcs} / ${data.total_pcs}`;
+                        const suspect = data.suspect_av_pcs || 0;
+                        document.getElementById('stat-online').innerHTML = suspect > 0
+                            ? `${data.online_pcs} / ${data.total_pcs} <small class="text-warning fs-6" title="Máy đang bật (Ping thông) nhưng mất Client">(${suspect} mất Client)</small>`
+                            : `${data.online_pcs} / ${data.total_pcs}`;
                     }
 
                     renderDeptStats(data.dept_summary, data.total_pcs);
@@ -1370,6 +1394,7 @@ def web_dashboard():
             async function loadData() {
                 const search = document.getElementById('search-input').value.trim();
                 const dept = document.getElementById('dept-filter').value;
+                const healthFilter = document.getElementById('health-filter') ? document.getElementById('health-filter').value : 'ALL';
                 
                 let url = '/api/inventory?';
                 if (search) url += 'search=' + encodeURIComponent(search) + '&';
@@ -1378,11 +1403,22 @@ def web_dashboard():
                 const tbody = document.getElementById('devices-body');
                 try {
                     const res = await fetch(url);
-                    const devices = await res.json();
-                    document.getElementById('filtered-count').innerText = `${devices.length} máy tính`;
+                    let devices = await res.json();
+                    const allOnline = devices.filter(d => d.is_online).length;
+                    const allSuspect = devices.filter(d => d.agent_health === 'NO_AGENT_SUSPECT_AV').length;
+                    document.getElementById('stat-online').innerHTML = allSuspect > 0
+                        ? `${allOnline} / ${devices.length} <small class="text-warning fs-6" title="Máy đang bật (Ping thông) nhưng mất Client">(${allSuspect} mất Client)</small>`
+                        : `${allOnline} / ${devices.length}`;
 
-                    const onlineCount = devices.filter(d => d.is_online).length;
-                    document.getElementById('stat-online').innerText = `${onlineCount} / ${devices.length}`;
+                    if (healthFilter === 'ONLINE') {
+                        devices = devices.filter(d => d.is_online);
+                    } else if (healthFilter === 'NO_AGENT_SUSPECT_AV') {
+                        devices = devices.filter(d => d.agent_health === 'NO_AGENT_SUSPECT_AV');
+                    } else if (healthFilter === 'OFFLINE') {
+                        devices = devices.filter(d => !d.is_online && d.agent_health !== 'NO_AGENT_SUSPECT_AV');
+                    }
+
+                    document.getElementById('filtered-count').innerText = `${devices.length} máy tính`;
 
                     if (devices.length === 0) {
                         tbody.innerHTML = '<tr><td colspan="10" class="text-center py-5 text-muted"><i class="bi bi-inbox fs-1 d-block mb-2"></i>Chưa có máy tính nào phù hợp bộ lọc</td></tr>';
@@ -1396,9 +1432,14 @@ def web_dashboard():
                         }
                         const barcodeHtml = d.barcode ? `<div class="mb-1"><span class="badge-barcode"><i class="bi bi-upc-scan me-1"></i>${escapeHtml(d.barcode)}</span></div>` : '';
                         
-                        const statusDot = d.is_online ? 
-                            '<span class="status-dot-on me-1" title="Đang Bật (Online)"></span> <small class="text-success fw-bold">ONLINE</small>' : 
-                            '<span class="status-dot-off me-1" title="Đã Tắt (Offline)"></span> <small class="text-muted">OFFLINE</small>';
+                        let statusDot;
+                        if (d.is_online) {
+                            statusDot = '<span class="status-dot-on me-1" title="Client đang chạy OK"></span> <small class="text-success fw-bold">ONLINE</small>';
+                        } else if (d.agent_health === 'NO_AGENT_SUSPECT_AV') {
+                            statusDot = '<span class="badge bg-warning text-dark" title="Ping mạng thông nhưng Port 8005 đóng & mất Heartbeat (Nghi AV diệt hoặc app tắt)"><i class="bi bi-exclamation-triangle-fill me-1"></i>MẤT CLIENT</small></span>';
+                        } else {
+                            statusDot = '<span class="status-dot-off me-1" title="Đã Tắt (Offline)"></span> <small class="text-muted">OFFLINE</small>';
+                        }
 
                         const lastSeenInfo = d.last_seen_relative ? `<div class="text-muted" style="font-size:0.7rem;" title="Tín hiệu cuối: ${d.last_seen || ''}"><i class="bi bi-broadcast me-1"></i>${escapeHtml(d.last_seen_relative)}</div>` : '';
                         const uptimeInfo = (d.is_online && d.uptime_hours) ? `<div class="text-success fw-bold" style="font-size:0.7rem;"><i class="bi bi-clock-history me-1"></i>Bật: ${d.uptime_hours}h</div>` : '';
@@ -1675,6 +1716,9 @@ def web_dashboard():
                 loadData();
             });
             document.getElementById('dept-filter').addEventListener('change', loadData);
+            if (document.getElementById('health-filter')) {
+                document.getElementById('health-filter').addEventListener('change', loadData);
+            }
 
             loadDepartments();
             loadAll();
@@ -1686,6 +1730,59 @@ def web_dashboard():
     </html>
     """
     return HTMLResponse(content=html_content)
+
+
+def _probe_single_stale_device(pc: dict):
+    """Kiểm tra 1 máy quá hạn Heartbeat: TCP Port 8005 + ICMP Ping."""
+    import socket
+    import subprocess
+    mac = pc.get("mac_address", "")
+    ip = pc.get("ip_address", "")
+    port = int(pc.get("client_agent_port") or 8005)
+    if not mac or not ip:
+        return
+
+    port_ok = False
+    try:
+        with socket.create_connection((ip, port), timeout=0.8):
+            port_ok = True
+    except Exception:
+        pass
+
+    ping_ok = False
+    if ip == "127.0.0.1":
+        ping_ok = True
+    else:
+        try:
+            creationflags = 0x08000000 if sys.platform == "win32" else 0
+            cmd = ["ping", "-n", "1", "-w", "600", ip] if sys.platform == "win32" else ["ping", "-c", "1", "-W", "1", ip]
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=creationflags)
+            ping_ok = (res.returncode == 0)
+        except Exception:
+            pass
+
+    if port_ok:
+        database.update_probe_result(mac, 1, 1 if ping_ok else 0, 1, "ONLINE")
+    elif ping_ok:
+        database.update_probe_result(mac, 0, 1, 0, "NO_AGENT_SUSPECT_AV")
+    else:
+        database.update_probe_result(mac, 0, 0, 0, "OFFLINE")
+
+
+def _background_probe_loop():
+    """Chỉ quét các máy quá hạn Heartbeat (>12 phút) mỗi 2 phút để phát hiện máy bật nhưng mất Client."""
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    time.sleep(15)
+    while True:
+        try:
+            stale = database.get_stale_computers_for_probe(OFFLINE_THRESHOLD_SECONDS)
+            if stale:
+                with ThreadPoolExecutor(max_workers=20) as ex:
+                    list(ex.map(_probe_single_stale_device, stale))
+        except Exception:
+            pass
+        time.sleep(120)
 
 
 if __name__ == "__main__":
@@ -1743,5 +1840,8 @@ if __name__ == "__main__":
             return True
 
     logging.getLogger("uvicorn.access").addFilter(_QuietHeartbeatFilter())
+
+    import threading
+    threading.Thread(target=_background_probe_loop, daemon=True).start()
 
     uvicorn.run(app, host=args.host, port=args.port)
