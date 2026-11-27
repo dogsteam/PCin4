@@ -411,6 +411,15 @@ def perform_self_update(url: str, expected_sha256: str = "") -> bool:
                     pass
             raise swap_err
 
+        global _MUTEX_HANDLE
+        if _MUTEX_HANDLE:
+            try:
+                import ctypes
+                ctypes.windll.kernel32.CloseHandle(_MUTEX_HANDLE)
+                _MUTEX_HANDLE = None
+            except Exception:
+                pass
+
         DETACHED_PROCESS = 0x00000008
         CREATE_NO_WINDOW = 0x08000000
         subprocess.Popen(
@@ -692,7 +701,15 @@ def run_silent_background_agent():
     - Tự động quét telemetry phần cứng lúc khởi động và gửi về DB Server
     - Định kỳ gửi heartbeat (0% CPU) và phát hiện tắt máy
     """
-    if is_already_running_mutex():
+    # Đợi tối đa 6 giây nếu tiến trình cũ vừa self-update đang thoát dần
+    already_running = False
+    for _ in range(6):
+        if not is_already_running_mutex():
+            already_running = False
+            break
+        already_running = True
+        time.sleep(1)
+    if already_running:
         sys.exit(0)
 
     log_sync("==================================================")

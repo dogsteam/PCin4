@@ -130,6 +130,12 @@ class RemoteUpdateAllPayload(BaseModel):
     url: Optional[str] = ""
 
 
+class RemoteUpdateBatchPayload(BaseModel):
+    mac_addresses: List[str]
+    target_version: Optional[str] = ""
+    url: Optional[str] = ""
+
+
 class RemotePingPayload(BaseModel):
     mac_address: Optional[str] = ""
     ip_address: Optional[str] = ""
@@ -333,30 +339,11 @@ def remote_update(req: RemoteUpdatePayload):
     }
 
 
-@app.post("/api/remote/update-all", tags=["Điều khiển từ xa"])
-def remote_update_all(req: RemoteUpdateAllPayload):
+def _dispatch_update_to_devices(devices: list, update_file_url: str, sha256_hash: str) -> int:
+    """Xếp hàng lệnh update và đẩy song song qua Port 8005 cho một danh sách máy."""
     import urllib.request
     import json
     from concurrent.futures import ThreadPoolExecutor
-
-    target_ver = (req.target_version or "1.3.1").strip()
-    update_file_url = (req.url or "").strip() or "http://10.10.12.188:8000/in4.exe"
-    sha256_hash = _get_local_in4_sha256() if update_file_url.rstrip("/").endswith("/in4.exe") else ""
-
-    # Lưu phiên bản mục tiêu (Desired State) để các máy bật sau / tương lai tự đối chiếu
-    database.set_setting("target_client_version", target_ver)
-    database.set_setting("target_client_url", update_file_url)
-
-    outdated = database.get_outdated_computers(target_ver)
-    if not outdated:
-        return {
-            "status": "success",
-            "target_version": target_ver,
-            "outdated_count": 0,
-            "direct_delivered": 0,
-            "queued_count": 0,
-            "message": f"✓ Toàn bộ máy trạm đã ở phiên bản {target_ver}!"
-        }
 
     cmd_payload = {"url": update_file_url}
     if sha256_hash:
@@ -384,10 +371,34 @@ def remote_update_all(req: RemoteUpdateAllPayload):
 
     direct_ok_count = 0
     with ThreadPoolExecutor(max_workers=15) as executor:
-        for ok in executor.map(_push_one, outdated):
+        for ok in executor.map(_push_one, devices):
             if ok:
                 direct_ok_count += 1
+    return direct_ok_count
 
+
+@app.post("/api/remote/update-all", tags=["Điều khiển từ xa"])
+def remote_update_all(req: RemoteUpdateAllPayload):
+    target_ver = (req.target_version or "1.3.1").strip()
+    update_file_url = (req.url or "").strip() or "http://10.10.12.188:8000/in4.exe"
+    sha256_hash = _get_local_in4_sha256() if update_file_url.rstrip("/").endswith("/in4.exe") else ""
+
+    # Lưu phiên bản mục tiêu (Desired State) để các máy bật sau / tương lai tự đối chiếu
+    database.set_setting("target_client_version", target_ver)
+    database.set_setting("target_client_url", update_file_url)
+
+    outdated = database.get_outdated_computers(target_ver)
+    if not outdated:
+        return {
+            "status": "success",
+            "target_version": target_ver,
+            "outdated_count": 0,
+            "direct_delivered": 0,
+            "queued_count": 0,
+            "message": f"✓ Toàn bộ máy trạm đã ở phiên bản {target_ver}!"
+        }
+
+    direct_ok_count = _dispatch_update_to_devices(outdated, update_file_url, sha256_hash)
     return {
         "status": "success",
         "target_version": target_ver,
@@ -397,6 +408,36 @@ def remote_update_all(req: RemoteUpdateAllPayload):
         "message": (
             f"✓ Đã đặt phiên bản mục tiêu v{target_ver} cho {len(outdated)} máy chưa cập nhật "
             f"({direct_ok_count} máy nhận tức thì qua Port 8005, {len(outdated) - direct_ok_count} máy chờ nhận qua Heartbeat/khi bật máy)."
+        )
+    }
+
+
+@app.post("/api/remote/update-batch", tags=["Điều khiển từ xa"])
+def remote_update_batch(req: RemoteUpdateBatchPayload):
+    """Chủ động đẩy lệnh update cho một nhóm máy cụ thể (theo danh sách MAC đang lọc)."""
+    if not req.mac_addresses:
+        raise HTTPException(status_code=400, detail="Danh sách máy trống!")
+
+    update_file_url = (req.url or "").strip() or "http://10.10.12.188:8000/in4.exe"
+    sha256_hash = _get_local_in4_sha256() if update_file_url.rstrip("/").endswith("/in4.exe") else ""
+    if req.target_version and req.target_version.strip():
+        database.set_setting("target_client_version", req.target_version.strip())
+        database.set_setting("target_client_url", update_file_url)
+
+    mac_set = {m.strip().upper() for m in req.mac_addresses if m and m.strip()}
+    targets = [c for c in database.get_all_computers() if (c.get("mac_address") or "").upper() in mac_set]
+    if not targets:
+        raise HTTPException(status_code=404, detail="Không tìm thấy máy phù hợp trong CSDL!")
+
+    direct_ok_count = _dispatch_update_to_devices(targets, update_file_url, sha256_hash)
+    return {
+        "status": "success",
+        "total_targeted": len(targets),
+        "direct_delivered": direct_ok_count,
+        "queued_count": len(targets) - direct_ok_count,
+        "message": (
+            f"✓ Đã đẩy lệnh cập nhật cho nhóm {len(targets)} máy "
+            f"({direct_ok_count} máy nhận tức thì qua Port 8005, {len(targets) - direct_ok_count} máy chờ nhận qua Heartbeat)."
         )
     }
 
@@ -533,7 +574,8 @@ def check_single_device_ping(mac: str, ip: str, port: int = 8005) -> dict:
         "icmp_success": icmp_success,
         "icmp_latency_ms": icmp_latency_ms,
         "agent_port_active": agent_port_active,
-        "agent_info": agent_info
+        "agent_info": agent_info,
+        "db_client_version": (pc.get("client_version") or "1.3.0") if pc else "1.3.0"
     }
 
 
@@ -790,6 +832,7 @@ def web_dashboard():
                             <div>
                                 <div class="text-muted small fw-bold">TỔNG MÁY TÍNH</div>
                                 <div class="fs-3 fw-bold text-dark" id="stat-total">0</div>
+                                <div id="stat-version-sub" class="mt-1"></div>
                             </div>
                         </div>
                     </div>
@@ -1020,34 +1063,43 @@ def web_dashboard():
                 <div class="tab-pane fade" id="tab-list" role="tabpanel">
                     <div class="panel-box">
                         <div class="row g-2 mb-3 align-items-center">
-                            <div class="col-md-4">
-                                <div class="input-group">
+                            <div class="col-md-3">
+                                <div class="input-group input-group-sm">
                                     <span class="input-group-text bg-light border-end-0"><i class="bi bi-search text-muted"></i></span>
                                     <input type="text" id="search-input" class="form-control bg-light border-start-0" 
-                                        placeholder="🔍 Tìm nhanh: Mã vạch, Tên máy, IP, MAC, Bác sĩ, User...">
+                                        placeholder="🔍 Mã vạch, Tên máy, IP, MAC, User...">
                                 </div>
                             </div>
-                            <div class="col-md-3">
-                                <select id="dept-filter" class="form-select bg-light">
+                            <div class="col-md-2">
+                                <select id="dept-filter" class="form-select form-select-sm bg-light">
                                     <option value="Tất cả">-- Tất cả Khoa / Phòng --</option>
                                 </select>
                             </div>
                             <div class="col-md-2">
-                                <select id="health-filter" class="form-select bg-light">
+                                <select id="health-filter" class="form-select form-select-sm bg-light">
                                     <option value="ALL">-- Tất cả trạng thái --</option>
                                     <option value="ONLINE">🟢 Client đang chạy</option>
-                                    <option value="NO_AGENT_SUSPECT_AV">⚠️ Bật máy, mất Client (Nghi AV)</option>
+                                    <option value="NO_AGENT_SUSPECT_AV">⚠️ Bật máy, mất IN4</option>
                                     <option value="OFFLINE">⚫ Offline (Tắt máy)</option>
                                 </select>
                             </div>
+                            <div class="col-md-2">
+                                <select id="version-filter" class="form-select form-select-sm bg-light">
+                                    <option value="ALL">-- Tất cả phiên bản --</option>
+                                    <option value="OUTDATED">⚠ Bản cũ (cần update)</option>
+                                </select>
+                            </div>
                             <div class="col-md-3 text-end">
-                                <button class="btn btn-sm btn-outline-success fw-bold me-1" onclick="updateAllClients()" id="btn-update-all" title="Phát hành bản in4.exe mới cho tất cả máy chưa cập nhật">
+                                <button class="btn btn-sm btn-warning fw-bold text-dark me-1" onclick="updateFilteredDevices()" id="btn-update-filtered" title="Cập nhật đúng các máy đang lọc trên bảng (theo khoa / phiên bản)">
+                                    <i class="bi bi-arrow-repeat me-1"></i>Update nhóm
+                                </button>
+                                <button class="btn btn-sm btn-outline-success fw-bold me-1" onclick="updateAllClients()" id="btn-update-all" title="Phát hành bản in4.exe mới cho toàn viện">
                                     <i class="bi bi-cloud-arrow-up me-1"></i>Update All
                                 </button>
-                                <button class="btn btn-sm btn-outline-primary fw-bold me-2" onclick="pingAllDevices()" id="btn-ping-all" title="Gửi gói kiểm tra và làm mới trạng thái toàn viện">
-                                    <i class="bi bi-broadcast-pin me-1"></i>⚡ Ping toàn viện
+                                <button class="btn btn-sm btn-outline-primary fw-bold me-1" onclick="pingAllDevices()" id="btn-ping-all" title="Gửi gói kiểm tra và làm mới trạng thái toàn viện">
+                                    <i class="bi bi-broadcast-pin"></i>
                                 </button>
-                                <span class="badge bg-secondary px-3 py-2" id="filtered-count">0 máy tính</span>
+                                <span class="badge bg-secondary px-2 py-2" id="filtered-count">0 máy</span>
                             </div>
                         </div>
 
@@ -1174,6 +1226,8 @@ def web_dashboard():
             let updateModalObj = null;
             let pingModalObj = null;
             let currentPingTarget = null;
+            let latestClientVersion = '1.3.1';
+            let currentFilteredDevices = [];
 
             document.addEventListener('DOMContentLoaded', () => {
                 notifyModalObj = new bootstrap.Modal(document.getElementById('notifyModal'));
@@ -1186,7 +1240,17 @@ def web_dashboard():
                     const res = await fetch('/api/statistics');
                     const data = await res.json();
 
+                    if (data.latest_client_version) {
+                        latestClientVersion = data.latest_client_version;
+                    }
                     document.getElementById('stat-total').innerText = data.total_pcs;
+                    const verSub = document.getElementById('stat-version-sub');
+                    if (verSub && data.latest_version_pcs !== undefined) {
+                        const outdated = data.outdated_pcs || 0;
+                        verSub.innerHTML = outdated > 0
+                            ? `<span class="badge bg-info text-dark" style="cursor:pointer;font-size:0.72rem;" onclick="filterOutdatedVersion()" title="Bấm để lọc các máy chưa lên v${escapeHtml(latestClientVersion)}">v${escapeHtml(latestClientVersion)}: ${data.latest_version_pcs}/${data.total_pcs} (${outdated} cũ)</span>`
+                            : `<span class="badge bg-success" style="font-size:0.72rem;">✓ 100% lên v${escapeHtml(latestClientVersion)}</span>`;
+                    }
                     document.getElementById('stat-dept').innerText = data.departments_count;
                     document.getElementById('dept-badge-count').innerText = `${data.departments_count} Khoa phòng`;
                     if (data.online_pcs !== undefined) {
@@ -1466,6 +1530,20 @@ def web_dashboard():
                 document.getElementById('dept-filter').value = 'Tất cả';
                 const hf = document.getElementById('health-filter');
                 if (hf) hf.value = 'NO_AGENT_SUSPECT_AV';
+                const vf = document.getElementById('version-filter');
+                if (vf) vf.value = 'ALL';
+                const tabBtn = document.getElementById('tab-list-btn');
+                if (tabBtn) tabBtn.click();
+                loadData();
+            }
+
+            function filterOutdatedVersion() {
+                document.getElementById('search-input').value = '';
+                document.getElementById('dept-filter').value = 'Tất cả';
+                const hf = document.getElementById('health-filter');
+                if (hf) hf.value = 'ALL';
+                const vf = document.getElementById('version-filter');
+                if (vf) vf.value = 'OUTDATED';
                 const tabBtn = document.getElementById('tab-list-btn');
                 if (tabBtn) tabBtn.click();
                 loadData();
@@ -1500,6 +1578,8 @@ def web_dashboard():
                 const search = document.getElementById('search-input').value.trim();
                 const dept = document.getElementById('dept-filter').value;
                 const healthFilter = document.getElementById('health-filter') ? document.getElementById('health-filter').value : 'ALL';
+                const versionFilterEl = document.getElementById('version-filter');
+                const versionFilter = versionFilterEl ? versionFilterEl.value : 'ALL';
                 
                 let url = '/api/inventory?';
                 if (search) url += 'search=' + encodeURIComponent(search) + '&';
@@ -1517,6 +1597,25 @@ def web_dashboard():
                             : `${allOnline} / ${devices.length}`;
                     }
 
+                    // Cập nhật danh sách phiên bản thực tế vào bộ lọc #version-filter
+                    if (versionFilterEl) {
+                        const verCounts = {};
+                        devices.forEach(d => {
+                            const v = (d.client_version || '1.3.0').trim();
+                            verCounts[v] = (verCounts[v] || 0) + 1;
+                        });
+                        const prevVal = versionFilterEl.value;
+                        const sortedVers = Object.keys(verCounts).sort().reverse();
+                        let optsHtml = `<option value="ALL">-- Tất cả phiên bản --</option>`;
+                        optsHtml += `<option value="OUTDATED">⚠ Bản cũ (chưa lên v${escapeHtml(latestClientVersion)})</option>`;
+                        sortedVers.forEach(v => {
+                            const tag = (v === latestClientVersion) ? ' (Mới nhất)' : '';
+                            optsHtml += `<option value="${escapeHtml(v)}">v${escapeHtml(v)}${tag} [${verCounts[v]} máy]</option>`;
+                        });
+                        versionFilterEl.innerHTML = optsHtml;
+                        versionFilterEl.value = prevVal;
+                    }
+
                     if (healthFilter === 'ONLINE') {
                         devices = devices.filter(d => d.is_online);
                     } else if (healthFilter === 'NO_AGENT_SUSPECT_AV') {
@@ -1525,7 +1624,14 @@ def web_dashboard():
                         devices = devices.filter(d => !d.is_online && d.agent_health !== 'NO_AGENT_SUSPECT_AV');
                     }
 
-                    document.getElementById('filtered-count').innerText = `${devices.length} máy tính`;
+                    if (versionFilter === 'OUTDATED') {
+                        devices = devices.filter(d => (d.client_version || '1.3.0').trim() !== latestClientVersion);
+                    } else if (versionFilter && versionFilter !== 'ALL') {
+                        devices = devices.filter(d => (d.client_version || '1.3.0').trim() === versionFilter);
+                    }
+
+                    currentFilteredDevices = devices;
+                    document.getElementById('filtered-count').innerText = `${devices.length} máy`;
 
                     if (devices.length === 0) {
                         tbody.innerHTML = '<tr><td colspan="10" class="text-center py-5 text-muted"><i class="bi bi-inbox fs-1 d-block mb-2"></i>Chưa có máy tính nào phù hợp bộ lọc</td></tr>';
@@ -1548,6 +1654,12 @@ def web_dashboard():
                             statusDot = '<span class="status-dot-off me-1" title="Đã Tắt (Offline)"></span> <small class="text-muted">OFFLINE</small>';
                         }
 
+                        const ver = (d.client_version || '1.3.0').trim();
+                        const isLatestVer = (ver === latestClientVersion);
+                        const versionBadge = isLatestVer
+                            ? `<div class="mt-1"><span class="badge bg-success bg-opacity-75" style="font-size:0.68rem;" title="Đã ở phiên bản mới nhất">v${escapeHtml(ver)} ✓</span></div>`
+                            : `<div class="mt-1"><span class="badge bg-secondary" style="font-size:0.68rem;" title="Bản cũ — cần cập nhật lên v${escapeHtml(latestClientVersion)}">v${escapeHtml(ver)} (Cũ)</span></div>`;
+
                         const lastSeenInfo = d.last_seen_relative ? `<div class="text-muted" style="font-size:0.7rem;" title="Tín hiệu cuối: ${d.last_seen || ''}"><i class="bi bi-broadcast me-1"></i>${escapeHtml(d.last_seen_relative)}</div>` : '';
                         const uptimeInfo = (d.is_online && d.uptime_hours) ? `<div class="text-success fw-bold" style="font-size:0.7rem;"><i class="bi bi-clock-history me-1"></i>Bật: ${d.uptime_hours}h</div>` : '';
 
@@ -1558,6 +1670,7 @@ def web_dashboard():
                         <tr class="device-row">
                             <td>
                                 <div>${statusDot}</div>
+                                ${versionBadge}
                                 ${uptimeInfo}
                                 ${lastSeenInfo}
                                 ${tamperWarning}
@@ -1683,6 +1796,24 @@ def web_dashboard():
                 } catch(e) { alert('Lỗi kết nối máy chủ: ' + e); }
             }
 
+            async function updateFilteredDevices() {
+                if (!currentFilteredDevices || currentFilteredDevices.length === 0) {
+                    alert('Không có máy nào trong danh sách đang lọc!');
+                    return;
+                }
+                const macs = currentFilteredDevices.map(d => d.mac_address).filter(Boolean);
+                if (!confirm(`Đẩy lệnh cập nhật in4.exe cho đúng ${macs.length} máy đang hiển thị trong bộ lọc?`)) return;
+                try {
+                    const res = await fetch('/api/remote/update-batch', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ mac_addresses: macs, target_version: latestClientVersion })
+                    });
+                    const result = await res.json();
+                    alert(result.message || '✓ Đã phát hành lệnh cập nhật cho nhóm đã lọc!');
+                } catch(e) { alert('Lỗi kết nối máy chủ: ' + e); }
+            }
+
             async function updateAllClients() {
                 const targetVer = prompt('Nhập phiên bản Client mục tiêu (Desired State) muốn phát hành cho toàn viện:', '1.3.1');
                 if (!targetVer || !targetVer.trim()) return;
@@ -1750,20 +1881,27 @@ def web_dashboard():
                     `<span class="badge bg-success"><i class="bi bi-check-circle-fill me-1"></i>Thành công (${data.icmp_latency_ms} ms)</span>` : 
                     `<span class="badge bg-secondary"><i class="bi bi-x-circle-fill me-1"></i>Timeout (Chặn ICMP / Tắt máy)</span>`;
 
+                const liveVer = data.agent_info?.version || data.db_client_version || '1.3.0';
+                const isLatest = (liveVer === latestClientVersion);
+                const verBadgeHtml = isLatest
+                    ? `<span class="badge bg-success ms-2">Client v${escapeHtml(liveVer)} (Mới nhất)</span>`
+                    : `<span class="badge bg-warning text-dark ms-2">Client v${escapeHtml(liveVer)} (Bản cũ)</span>`;
+
                 const hbBadge = data.heartbeat_active ? 
-                    `<span class="badge bg-success"><i class="bi bi-check-circle-fill me-1"></i>Đang nhận tín hiệu (${data.heartbeat_seconds_ago}s trước)</span>` : 
+                    `<span class="badge bg-success"><i class="bi bi-check-circle-fill me-1"></i>Đang nhận tín hiệu (${data.heartbeat_seconds_ago}s trước) · v${escapeHtml(data.db_client_version || '1.3.0')}</span>` : 
                     `<span class="badge bg-danger"><i class="bi bi-x-circle-fill me-1"></i>Không có tín hiệu (${data.heartbeat_seconds_ago !== null ? data.heartbeat_seconds_ago + 's trước' : 'Chưa có'})</span>`;
 
                 const agentBadge = data.agent_port_active ? 
-                    `<span class="badge bg-success"><i class="bi bi-check-circle-fill me-1"></i>Cổng 8005 mở (Phiên bản: ${data.agent_info?.version || '1.3.0'})</span>` : 
+                    `<span class="badge bg-success"><i class="bi bi-check-circle-fill me-1"></i>Cổng 8005 mở (Phiên bản: v${escapeHtml(data.agent_info?.version || '1.3.0')})</span>` : 
                     `<span class="badge bg-warning text-dark"><i class="bi bi-shield-lock me-1"></i>Không thể kết nối (Firewall chặn chiều vào)</span>`;
 
                 document.getElementById('ping-modal-body').innerHTML = `
                     <div class="card mb-3 border-0 bg-light">
                         <div class="card-body">
-                            <div class="d-flex align-items-center mb-2">
+                            <div class="d-flex align-items-center flex-wrap gap-1 mb-2">
                                 <span class="badge ${badgeClass} fs-6 px-3 py-2 me-2">${data.status_label}</span>
                                 <h6 class="fw-bold mb-0 text-dark">${escapeHtml(data.hostname || 'N/A')} <small class="text-muted">(${escapeHtml(data.ip_address || 'No IP')})</small></h6>
+                                ${verBadgeHtml}
                             </div>
                             <div class="text-secondary small mt-2">${escapeHtml(data.description)}</div>
                         </div>
@@ -1839,6 +1977,9 @@ def web_dashboard():
             document.getElementById('dept-filter').addEventListener('change', loadData);
             if (document.getElementById('health-filter')) {
                 document.getElementById('health-filter').addEventListener('change', loadData);
+            }
+            if (document.getElementById('version-filter')) {
+                document.getElementById('version-filter').addEventListener('change', loadData);
             }
 
             loadDepartments();

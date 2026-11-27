@@ -497,6 +497,20 @@ def get_statistics() -> Dict[str, Any]:
     """)
     os_summary = [dict(r) for r in cursor.fetchall()]
 
+    cursor.execute("SELECT value FROM system_settings WHERE key = 'target_client_version'")
+    trow = cursor.fetchone()
+    latest_ver = (trow["value"] if trow and trow["value"] else "1.3.1").strip()
+
+    cursor.execute("""
+    SELECT COALESCE(NULLIF(client_version, ''), '1.3.0') AS version, COUNT(*) AS count
+    FROM computers
+    GROUP BY version
+    ORDER BY version DESC
+    """)
+    version_summary = [dict(r) for r in cursor.fetchall()]
+    latest_version_pcs = sum(v["count"] for v in version_summary if v["version"] == latest_ver)
+    outdated_pcs = total - latest_version_pcs
+
     conn.close()
 
     standard_ratio = round((ssd_pcs / total * 100), 1) if total > 0 else 0
@@ -506,6 +520,10 @@ def get_statistics() -> Dict[str, Any]:
         "online_pcs": online_pcs,
         "suspect_av_pcs": suspect_av_pcs,
         "offline_pcs": offline_pcs,
+        "latest_client_version": latest_ver,
+        "latest_version_pcs": latest_version_pcs,
+        "outdated_pcs": outdated_pcs,
+        "version_summary": version_summary,
         "ssd_pcs": ssd_pcs,
         "low_ram_pcs": low_ram,
         "hdd_only_pcs": hdd_only,
