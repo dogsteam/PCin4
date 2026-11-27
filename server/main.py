@@ -123,6 +123,7 @@ class RemoteUpdatePayload(BaseModel):
     ip_address: Optional[str] = ""
     port: Optional[int] = 8005
     url: Optional[str] = ""
+    force: Optional[bool] = False
 
 
 class RemoteUpdateAllPayload(BaseModel):
@@ -177,16 +178,22 @@ def receive_heartbeat(data: HeartbeatPayload):
         )
         # Kiểm tra và trả về ngay các lệnh đang chờ (Thông báo / Cập nhật)
         pending_cmds = database.get_pending_commands(data.mac_address)
+        auto_updatable = database.is_auto_updatable_version(client_ver)
+        if not auto_updatable:
+            # Cách ly tuyệt đối v1.3.0: không bao giờ gửi lệnh update tự động qua Heartbeat
+            pending_cmds = [c for c in pending_cmds if c.get("type") != "update"]
+
         if pending_cmds:
             print(f"[HEARTBEAT-CMD] Giao {len(pending_cmds)} lenh cho {data.mac_address} ({data.ip_address}) | ver={client_ver}")
-        target_ver = database.get_setting("target_client_version", "").strip()
+
+        target_ver = database.get_setting("target_client_version", "").strip() if auto_updatable else ""
         resp_data = {
             "status": "success",
             "heartbeat_interval": HEARTBEAT_INTERVAL_SECONDS,
             "target_client_version": target_ver,
             "commands": pending_cmds
         }
-        if target_ver and client_ver and client_ver != target_ver:
+        if auto_updatable and target_ver and client_ver != target_ver:
             resp_data["update_url"] = database.get_setting("target_client_url", "http://10.10.12.188:8000/in4.exe")
             sha = _get_local_in4_sha256()
             if sha:
@@ -304,6 +311,15 @@ def remote_update(req: RemoteUpdatePayload):
     import json
 
     mac = req.mac_address or database.get_mac_by_ip(req.ip_address)
+    pc_info = database.get_computer_by_mac(mac) if mac else None
+    cur_ver = (pc_info.get("client_version") or "1.3.0").strip() if pc_info else "1.3.0"
+
+    if not database.is_auto_updatable_version(cur_ver) and not req.force:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Máy đang chạy v{cur_ver} đã được cách ly để tránh rớt agent. Chỉ hỗ trợ tự động cập nhật từ phiên bản >= 1.3.1!"
+        )
+
     update_file_url = req.url or f"http://10.10.12.188:8000/in4.exe"
     sha256_hash = ""
     if not req.url or req.url.rstrip("/").endswith("/in4.exe"):
@@ -317,12 +333,8 @@ def remote_update(req: RemoteUpdatePayload):
     if mac:
         cmd_id = database.queue_command(mac, "update", cmd_payload)
 
-    pc_info = database.get_computer_by_mac(mac) if mac else None
-    cur_ver = (pc_info.get("client_version") or "1.3.0").strip() if pc_info else "1.3.0"
-
     direct_ok = False
-    # Chỉ đẩy trực tiếp qua port 8005 với client >= 1.3.1 (v1.3.0 phải nhận qua Heartbeat Main Thread để tránh taskkill /T)
-    if req.ip_address and cur_ver != "1.3.0":
+    if req.ip_address and database.is_auto_updatable_version(cur_ver):
         try:
             target_url = f"http://{req.ip_address}:{req.port or 8005}/update"
             payload = json.dumps(cmd_payload).encode("utf-8")
@@ -407,7 +419,7 @@ def remote_update_all(req: RemoteUpdateAllPayload):
             "outdated_count": 0,
             "direct_delivered": 0,
             "queued_count": 0,
-            "message": f"✓ Toàn bộ máy trạm đã ở phiên bản {target_ver}!"
+            "message": f"✓ Tất cả máy >= v1.3.1 đã ở phiên bản v{target_ver}! (Các máy v1.3.0 cũ được cách ly an toàn)."
         }
 
     direct_ok_count = _dispatch_update_to_devices(outdated, update_file_url, sha256_hash)
@@ -418,15 +430,16 @@ def remote_update_all(req: RemoteUpdateAllPayload):
         "direct_delivered": direct_ok_count,
         "queued_count": len(outdated) - direct_ok_count,
         "message": (
-            f"✓ Đã đặt phiên bản mục tiêu v{target_ver} cho {len(outdated)} máy chưa cập nhật "
-            f"({direct_ok_count} máy nhận tức thì qua Port 8005, {len(outdated) - direct_ok_count} máy chờ nhận qua Heartbeat/khi bật máy)."
+            f"✓ Đã đặt phiên bản mục tiêu v{target_ver} cho {len(outdated)} máy (>= v1.3.1): "
+            f"{direct_ok_count} máy nhận tức thì qua Port 8005, {len(outdated) - direct_ok_count} máy tự cập nhật ở nhịp Heartbeat tiếp theo. "
+            f"(Các máy v1.3.0 cũ đã được cách ly, không bị ép update)."
         )
     }
 
 
 @app.post("/api/remote/update-batch", tags=["Điều khiển từ xa"])
 def remote_update_batch(req: RemoteUpdateBatchPayload):
-    """Chủ động đẩy lệnh update cho một nhóm máy cụ thể (theo danh sách MAC đang lọc)."""
+    """Chủ động đẩy lệnh update cho một nhóm máy cụ thể (>= 1.3.1, cách ly v1.3.0)."""
     if not req.mac_addresses:
         raise HTTPException(status_code=400, detail="Danh sách máy trống!")
 
@@ -437,19 +450,29 @@ def remote_update_batch(req: RemoteUpdateBatchPayload):
         database.set_setting("target_client_url", update_file_url)
 
     mac_set = {m.strip().upper() for m in req.mac_addresses if m and m.strip()}
-    targets = [c for c in database.get_all_computers() if (c.get("mac_address") or "").upper() in mac_set]
-    if not targets:
+    matched = [c for c in database.get_all_computers() if (c.get("mac_address") or "").upper() in mac_set]
+    if not matched:
         raise HTTPException(status_code=404, detail="Không tìm thấy máy phù hợp trong CSDL!")
+
+    targets = [c for c in matched if database.is_auto_updatable_version(c.get("client_version", ""))]
+    skipped_legacy = len(matched) - len(targets)
+    if not targets:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Toàn bộ {skipped_legacy} máy đang chọn thuộc bản v1.3.0 đã được cách ly an toàn. Chỉ tự động update cho máy >= v1.3.1!"
+        )
 
     direct_ok_count = _dispatch_update_to_devices(targets, update_file_url, sha256_hash)
     return {
         "status": "success",
         "total_targeted": len(targets),
+        "skipped_legacy": skipped_legacy,
         "direct_delivered": direct_ok_count,
         "queued_count": len(targets) - direct_ok_count,
         "message": (
-            f"✓ Đã đẩy lệnh cập nhật cho nhóm {len(targets)} máy "
-            f"({direct_ok_count} máy nhận tức thì qua Port 8005, {len(targets) - direct_ok_count} máy chờ nhận qua Heartbeat)."
+            f"✓ Đã đẩy cập nhật cho {len(targets)} máy (>= v1.3.1): "
+            f"{direct_ok_count} nhận tức thì, {len(targets) - direct_ok_count} chờ Heartbeat. "
+            f"(Đã bỏ qua an toàn {skipped_legacy} máy v1.3.0)."
         )
     }
 
@@ -1686,6 +1709,11 @@ def web_dashboard():
                         const tamperWarning = d.hardware_tampered ? 
                             `<div class="mt-1"><span class="badge bg-danger pulse-alert" title="${escapeHtml(d.tamper_details || '')}"><i class="bi bi-shield-slash me-1"></i>Phần cứng đổi!</span></div>` : '';
 
+                        const isLegacyVer = (ver === '1.3.0');
+                        const updateBtnHtml = isLegacyVer
+                            ? `<button class="btn btn-outline-secondary" disabled title="Đã cách ly auto-update cho v1.3.0 (chỉ tự update từ v1.3.1+)"><i class="bi bi-shield-lock"></i></button>`
+                            : `<button class="btn btn-outline-warning text-dark" onclick="openUpdateModal('${d.ip_address}', ${d.client_agent_port || 8005}, '${escapeHtml(d.hostname)}', '${d.mac_address}')" title="Cập nhật client từ xa"><i class="bi bi-arrow-repeat"></i></button>`;
+
                         return `
                         <tr class="device-row">
                             <td>
@@ -1736,9 +1764,7 @@ def web_dashboard():
                                     <button class="btn btn-outline-primary" onclick="openNotifyModal('${d.ip_address}', ${d.client_agent_port || 8005}, '${escapeHtml(d.hostname)} - ${escapeHtml(d.user_name)}', '${d.mac_address}')" title="Gửi thông báo màn hình">
                                         <i class="bi bi-bell-fill"></i>
                                     </button>
-                                    <button class="btn btn-outline-warning text-dark" onclick="openUpdateModal('${d.ip_address}', ${d.client_agent_port || 8005}, '${escapeHtml(d.hostname)}', '${d.mac_address}')" title="Cập nhật client từ xa">
-                                        <i class="bi bi-arrow-repeat"></i>
-                                    </button>
+                                    ${updateBtnHtml}
                                     <button class="btn btn-outline-danger" onclick="deleteDevice('${d.mac_address}')" title="Xóa máy này">
                                         <i class="bi bi-trash"></i>
                                     </button>

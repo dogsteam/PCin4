@@ -436,6 +436,14 @@ def perform_self_update(url: str, expected_sha256: str = "") -> bool:
     temp_exe = os.path.join(agent_dir, "in4_new.tmp")
 
     try:
+        if expected_sha256 and os.path.exists(target_exe):
+            try:
+                if _calc_file_sha256(target_exe) == expected_sha256.strip().lower():
+                    log_sync("✓ in4.exe hiện tại đã khớp mã SHA256 mới nhất, bỏ qua cập nhật lặp.")
+                    return True
+            except Exception:
+                pass
+
         urllib.request.urlretrieve(url, temp_exe)
         if not os.path.exists(temp_exe) or os.path.getsize(temp_exe) < 4 * 1024 * 1024:
             log_sync("✗ File tải về không hợp lệ (< 4MB)!")
@@ -822,6 +830,20 @@ def run_silent_background_agent():
     last_telemetry_ts = time.time()
     time.sleep(random.randint(0, 30))
 
+    def _sleep_with_wakeup_detect(total_sec: int):
+        elapsed = 0
+        step = 15
+        while elapsed < total_sec:
+            chunk = min(step, total_sec - elapsed)
+            t0 = time.time()
+            time.sleep(chunk)
+            dt = time.time() - t0
+            # Nếu thời gian thực nhảy vọt (>45s so với chunk 15s) -> vừa tỉnh từ Sleep/Standby
+            if dt - chunk > 45:
+                time.sleep(5)
+                break
+            elapsed += chunk
+
     while True:
         try:
             meta = load_saved_agent_config()
@@ -840,8 +862,8 @@ def run_silent_background_agent():
                 ip = hw_data.get("ip_address", "")
                 send_telemetry(hw_data, meta, server_url)
 
-            time.sleep(heartbeat_interval)
+            _sleep_with_wakeup_detect(heartbeat_interval)
 
         except Exception as loop_err:
             log_sync(f"Lỗi vòng lặp nền: {loop_err}")
-            time.sleep(heartbeat_interval)
+            _sleep_with_wakeup_detect(heartbeat_interval)

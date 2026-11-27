@@ -148,6 +148,17 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_computers_dept ON computers(department);")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_power_mac ON power_logs(mac_address);")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_hw_hist_mac ON hardware_history(mac_address);")
+
+    # Cách ly an toàn: hủy mọi lệnh 'update' còn tồn đọng cho các máy v1.3.0 cũ
+    cursor.execute("""
+    UPDATE pending_commands
+    SET status = 'cancelled'
+    WHERE status = 'pending' AND command_type = 'update'
+      AND mac_address IN (
+          SELECT mac_address FROM computers
+          WHERE COALESCE(NULLIF(client_version, ''), '1.3.0') = '1.3.0'
+      )
+    """)
     conn.commit()
     conn.close()
 
@@ -596,8 +607,20 @@ def set_setting(key: str, value: str):
     conn.close()
 
 
+def is_auto_updatable_version(ver: str) -> bool:
+    """Chỉ cho phép tự động update từ xa đối với client phiên bản >= 1.3.1 (cách ly v1.3.0)."""
+    v = (ver or "").strip().lstrip("vV")
+    if not v or v == "1.3.0":
+        return False
+    try:
+        parts = tuple(int(x) for x in v.split(".")[:3])
+        return parts >= (1, 3, 1)
+    except Exception:
+        return False
+
+
 def get_outdated_computers(target_version: str) -> List[Dict[str, Any]]:
-    """Lấy danh sách các máy có client_version khác với phiên bản mục tiêu."""
+    """Lấy danh sách các máy >= 1.3.1 có client_version khác với phiên bản mục tiêu."""
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("""
@@ -605,9 +628,9 @@ def get_outdated_computers(target_version: str) -> List[Dict[str, Any]]:
     FROM computers
     WHERE COALESCE(NULLIF(client_version, ''), '1.3.0') != ?
     """, (target_version,))
-    rows = cursor.fetchall()
+    rows = [dict(r) for r in cursor.fetchall()]
     conn.close()
-    return [dict(r) for r in rows]
+    return [r for r in rows if is_auto_updatable_version(r.get("client_version", ""))]
 
 
 def get_computer_by_mac(mac_address: str) -> Optional[Dict[str, Any]]:
