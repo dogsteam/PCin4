@@ -32,10 +32,30 @@ if getattr(sys, 'frozen', False):
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def lifespan(app_instance: FastAPI):
+    database.init_db()
+    import threading
+    import time
+    def _bg_status_updater():
+        while True:
+            try:
+                database.update_online_status_threshold(OFFLINE_THRESHOLD_SECONDS)
+            except Exception:
+                pass
+            time.sleep(60)
+    threading.Thread(target=_bg_status_updater, daemon=True).start()
+    yield
+
+
 app = FastAPI(
     title="Hệ thống Quản lý Thiết bị & Phần cứng PC Bệnh viện",
     description="API tiếp nhận thông số phần cứng từ máy trạm và cung cấp Dashboard tra cứu",
-    version="1.2.0"
+    version="1.2.0",
+    lifespan=lifespan
 )
 
 app.add_middleware(
@@ -45,23 +65,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.on_event("startup")
-def startup_event():
-    database.init_db()
-    
-    # Tiến trình nền tự động quét và đánh dấu Offline cho máy không gửi tín hiệu trong 45 giây
-    import threading
-    import time
-    def _bg_status_updater():
-        while True:
-            try:
-                database.update_online_status_threshold(45)
-            except Exception:
-                pass
-            time.sleep(10)
-    threading.Thread(target=_bg_status_updater, daemon=True).start()
 
 
 class InventoryPayload(BaseModel):
@@ -1189,7 +1192,7 @@ def web_dashboard():
                     if (data.online_pcs !== undefined) {
                         const suspect = data.suspect_av_pcs || 0;
                         document.getElementById('stat-online').innerHTML = suspect > 0
-                            ? `${data.online_pcs} / ${data.total_pcs} <small class="text-warning fs-6" title="Máy đang bật (Ping thông) nhưng mất Client">(${suspect} mất Client)</small>`
+                            ? `${data.online_pcs} / ${data.total_pcs} <div class="mt-1"><span class="badge bg-warning text-dark" style="cursor:pointer;font-size:0.75rem;" onclick="filterSuspectAV()" title="Bấm để xem các máy đang bật (Ping thông) nhưng không thấy phần mềm IN4">${suspect} máy bật / mất IN4</span></div>`
                             : `${data.online_pcs} / ${data.total_pcs}`;
                     }
 
@@ -1458,6 +1461,16 @@ def web_dashboard():
                 }).join('');
             }
 
+            function filterSuspectAV() {
+                document.getElementById('search-input').value = '';
+                document.getElementById('dept-filter').value = 'Tất cả';
+                const hf = document.getElementById('health-filter');
+                if (hf) hf.value = 'NO_AGENT_SUSPECT_AV';
+                const tabBtn = document.getElementById('tab-list-btn');
+                if (tabBtn) tabBtn.click();
+                loadData();
+            }
+
             function filterByDept(deptName) {
                 const tabListBtn = document.getElementById('tab-list-btn');
                 const triggerTab = new bootstrap.Tab(tabListBtn);
@@ -1496,11 +1509,13 @@ def web_dashboard():
                 try {
                     const res = await fetch(url);
                     let devices = await res.json();
-                    const allOnline = devices.filter(d => d.is_online).length;
-                    const allSuspect = devices.filter(d => d.agent_health === 'NO_AGENT_SUSPECT_AV').length;
-                    document.getElementById('stat-online').innerHTML = allSuspect > 0
-                        ? `${allOnline} / ${devices.length} <small class="text-warning fs-6" title="Máy đang bật (Ping thông) nhưng mất Client">(${allSuspect} mất Client)</small>`
-                        : `${allOnline} / ${devices.length}`;
+                    if (!search && (!dept || dept === 'Tất cả')) {
+                        const allOnline = devices.filter(d => d.is_online).length;
+                        const allSuspect = devices.filter(d => d.agent_health === 'NO_AGENT_SUSPECT_AV').length;
+                        document.getElementById('stat-online').innerHTML = allSuspect > 0
+                            ? `${allOnline} / ${devices.length} <div class="mt-1"><span class="badge bg-warning text-dark" style="cursor:pointer;font-size:0.75rem;" onclick="filterSuspectAV()" title="Bấm để xem các máy đang bật (Ping thông) nhưng không thấy phần mềm IN4">${allSuspect} máy bật / mất IN4</span></div>`
+                            : `${allOnline} / ${devices.length}`;
+                    }
 
                     if (healthFilter === 'ONLINE') {
                         devices = devices.filter(d => d.is_online);

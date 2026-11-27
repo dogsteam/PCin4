@@ -63,13 +63,21 @@ def is_already_running_mutex() -> bool:
         return False
 
 
+def is_packaged_exe() -> bool:
+    """Nhận diện đang chạy từ bản đóng gói .exe (hỗ trợ cả Nuitka và PyInstaller)."""
+    if getattr(sys, "frozen", False) or ("__compiled__" in globals()):
+        return True
+    exe_name = os.path.basename(sys.executable).lower()
+    return exe_name.endswith(".exe") and not exe_name.startswith("python")
+
+
 def spawn_background_process() -> bool:
     """Khởi động tiến trình in4.exe --silent chạy ngầm hoàn toàn tách biệt."""
     try:
         agent_dir = get_agent_dir()
         target_exe = os.path.join(agent_dir, "in4.exe")
         if not os.path.exists(target_exe):
-            current_exe = os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__)
+            current_exe = os.path.abspath(sys.executable if is_packaged_exe() else __file__)
             if current_exe.lower().endswith(".exe") and os.path.exists(current_exe):
                 target_exe = current_exe
             else:
@@ -167,7 +175,7 @@ def request_uac_elevation_if_needed() -> bool:
 
     try:
         import ctypes
-        if getattr(sys, "frozen", False):
+        if is_packaged_exe():
             exe = sys.executable
             extra_args = [a for a in sys.argv[1:] if a != "--no-uac"]
         else:
@@ -187,15 +195,15 @@ def request_uac_elevation_if_needed() -> bool:
 
 def ensure_defender_exclusion(target_dir: str = None) -> bool:
     """
-    Thêm thư mục Agent vào danh sách loại trừ (ExclusionPath) của Windows Defender.
-    - Nếu đang chạy với quyền Admin: thực thi thành công và tạo marker .defender_excluded.
+    Thêm thư mục Agent và thư mục runtime cache (Nuitka) vào danh sách loại trừ của Windows Defender.
+    - Nếu đang chạy với quyền Admin: thực thi thành công và tạo marker .defender_excluded_v2.
     - Nếu chạy với quyền User thường: fail an toàn, không làm gián đoạn ứng dụng.
     """
     if sys.platform != "win32":
         return False
 
     agent_dir = target_dir or get_agent_dir()
-    marker_file = os.path.join(agent_dir, ".defender_excluded")
+    marker_file = os.path.join(agent_dir, ".defender_excluded_v2")
     if os.path.exists(marker_file):
         return True
 
@@ -204,8 +212,15 @@ def ensure_defender_exclusion(target_dir: str = None) -> bool:
         return False
 
     try:
-        escaped_dir = agent_dir.replace("'", "''")
-        ps_cmd = f"Add-MpPreference -ExclusionPath '{escaped_dir}'"
+        paths_to_exclude = [agent_dir]
+        local_app = os.environ.get("LOCALAPPDATA", "")
+        if local_app:
+            cache_dir = os.path.join(local_app, "IN4_Agent")
+            if os.path.normcase(cache_dir) != os.path.normcase(agent_dir):
+                paths_to_exclude.append(cache_dir)
+
+        ps_array = ",".join("'" + p.replace("'", "''") + "'" for p in paths_to_exclude)
+        ps_cmd = f"Add-MpPreference -ExclusionPath @({ps_array})"
         CREATE_NO_WINDOW = 0x08000000
         res = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd],
@@ -220,7 +235,7 @@ def ensure_defender_exclusion(target_dir: str = None) -> bool:
                     f.write(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             except Exception:
                 pass
-            log_sync(f"✓ Đã thêm thư mục vào Windows Defender Exclusion: {agent_dir}")
+            log_sync(f"✓ Đã thêm thư mục vào Windows Defender Exclusion: {', '.join(paths_to_exclude)}")
             return True
         else:
             log_sync(f"⚠ Add-MpPreference trả mã {res.returncode}: {(res.stderr or '').strip()}")
@@ -260,7 +275,7 @@ def install_auto_start(metadata: dict = None) -> bool:
         ensure_defender_exclusion(agent_dir)
 
         # 1. Sao chép in4.exe vào thư mục cố định
-        current_exe = os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__)
+        current_exe = os.path.abspath(sys.executable if is_packaged_exe() else __file__)
         if current_exe.lower().endswith(".exe") and os.path.exists(current_exe):
             if current_exe.lower() != target_exe.lower():
                 try:

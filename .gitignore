@@ -36,11 +36,15 @@ in4_error.log
 agent_service.log
 in4_agent.log
 
-# PyInstaller & Build artifacts
+# PyInstaller / Nuitka & Build artifacts
 client/build/
 client/dist/
 client/build_dir/
 client/dist_dir/
+client/build_nuitka/
+*.build/
+*.dist/
+*.onefile-build/
 server/build/
 server/dist/
 *.spec

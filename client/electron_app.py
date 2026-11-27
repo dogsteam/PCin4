@@ -22,8 +22,14 @@ import webview
 
 import hardware_collector
 
-# Đường dẫn thư mục chạy app (nếu đóng gói exe thì là thư mục chứa exe)
-if getattr(sys, 'frozen', False):
+# Đường dẫn thư mục chạy app (hỗ trợ cả Nuitka và PyInstaller)
+_IS_PACKAGED = (
+    getattr(sys, 'frozen', False)
+    or ("__compiled__" in globals())
+    or (sys.executable.lower().endswith(".exe") and not os.path.basename(sys.executable).lower().startswith("python"))
+)
+RESOURCE_DIR = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+if _IS_PACKAGED:
     APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
 else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -101,20 +107,13 @@ OFFICIAL_DEPARTMENTS = [
 
 
 def load_config() -> dict:
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            log_error(f"Lỗi đọc config.json: {e}")
-    if getattr(sys, 'frozen', False):
-        bundled_config = os.path.join(getattr(sys, '_MEIPASS', ''), "config.json")
-        if os.path.exists(bundled_config):
+    for candidate in (CONFIG_FILE, os.path.join(RESOURCE_DIR, "config.json")):
+        if os.path.exists(candidate):
             try:
-                with open(bundled_config, "r", encoding="utf-8") as f:
+                with open(candidate, "r", encoding="utf-8") as f:
                     return json.load(f)
-            except Exception:
-                pass
+            except Exception as e:
+                log_error(f"Lỗi đọc config.json ({candidate}): {e}")
     return {"server_url": DEFAULT_SERVER_URL}
 
 
@@ -1078,7 +1077,7 @@ class BridgeApi:
 
 def main():
     is_silent = ("--silent" in sys.argv)
-    exe_path = os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__)
+    exe_path = os.path.abspath(sys.executable if _IS_PACKAGED else __file__)
     # Khi khởi động ngầm trong thư mục cài đặt IN4_Agent, luôn chạy ngầm 100% không bao giờ mở UI
     if "in4_agent" in exe_path.lower() and "--gui" not in sys.argv:
         is_silent = True
@@ -1130,20 +1129,24 @@ def main():
 
         # Favicon base64
         icon_b64 = ""
-        b64_file = os.path.join(APP_DIR, "icon_b64.txt")
-        if os.path.exists(b64_file):
-            try:
-                with open(b64_file, "r", encoding="utf-8") as f:
-                    icon_b64 = f.read().strip()
-            except Exception: pass
-        if not icon_b64:
-            icon_png = os.path.join(APP_DIR, "app_icon.png")
-            if os.path.exists(icon_png):
+        for b64_file in (os.path.join(APP_DIR, "icon_b64.txt"), os.path.join(RESOURCE_DIR, "icon_b64.txt")):
+            if os.path.exists(b64_file):
                 try:
-                    import base64
-                    with open(icon_png, "rb") as f:
-                        icon_b64 = base64.b64encode(f.read()).decode("utf-8")
+                    with open(b64_file, "r", encoding="utf-8") as f:
+                        icon_b64 = f.read().strip()
+                    if icon_b64:
+                        break
                 except Exception: pass
+        if not icon_b64:
+            for icon_png in (os.path.join(APP_DIR, "app_icon.png"), os.path.join(RESOURCE_DIR, "app_icon.png")):
+                if os.path.exists(icon_png):
+                    try:
+                        import base64
+                        with open(icon_png, "rb") as f:
+                            icon_b64 = base64.b64encode(f.read()).decode("utf-8")
+                        if icon_b64:
+                            break
+                    except Exception: pass
         html_ready = html_ready.replace("__FAVICON_BASE64__", icon_b64)
 
         window = webview.create_window(
