@@ -177,6 +177,8 @@ def receive_heartbeat(data: HeartbeatPayload):
         )
         # Kiểm tra và trả về ngay các lệnh đang chờ (Thông báo / Cập nhật)
         pending_cmds = database.get_pending_commands(data.mac_address)
+        if pending_cmds:
+            print(f"[HEARTBEAT-CMD] Giao {len(pending_cmds)} lenh cho {data.mac_address} ({data.ip_address}) | ver={client_ver}")
         target_ver = database.get_setting("target_client_version", "").strip()
         resp_data = {
             "status": "success",
@@ -327,8 +329,13 @@ def remote_update(req: RemoteUpdatePayload):
                     direct_ok = True
                     if cmd_id:
                         database.ack_command(cmd_id)
-        except Exception:
-            pass
+        except Exception as push_err:
+            print(f"[UPDATE-PUSH] Khong goi duoc {req.ip_address}:{req.port or 8005} -> cho vao hang doi ({push_err})")
+
+    if direct_ok:
+        print(f"[UPDATE-PUSH] Da day lenh update truc tiep toi {req.ip_address}:{req.port or 8005} (MAC={mac})")
+    elif mac:
+        print(f"[UPDATE-QUEUE] Da xep lenh update vao hang doi cho MAC={mac} (cmd_id={cmd_id})")
 
     return {
         "status": "success",
@@ -623,6 +630,14 @@ def list_computers(search: Optional[str] = None, department: Optional[str] = Non
 @app.get("/api/statistics", tags=["Quản lý"])
 def get_stats():
     return database.get_statistics()
+
+
+@app.get("/api/remote/pending", tags=["Điều khiển từ xa"])
+def get_pending_queue():
+    conn = database.get_db_connection()
+    rows = conn.execute("SELECT id, mac_address, command_type, status, created_at, executed_at FROM pending_commands ORDER BY id DESC LIMIT 50").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 @app.get("/api/departments", tags=["Quản lý"])
