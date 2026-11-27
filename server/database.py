@@ -111,6 +111,14 @@ def init_db():
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_pending_mac_status ON pending_commands(mac_address, status);")
 
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS system_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
     # Migration thêm cột nếu bảng computers đã có từ trước
     migrations = [
         ("barcode", "TEXT"),
@@ -520,7 +528,7 @@ def delete_computer(mac_address: str) -> bool:
     return deleted
 
 
-def record_heartbeat(mac_address: str, ip_address: str, logged_in_user: str = "", uptime_hours: float = 0, boot_time: str = ""):
+def record_heartbeat(mac_address: str, ip_address: str, logged_in_user: str = "", uptime_hours: float = 0, boot_time: str = "", client_version: str = ""):
     """Cập nhật tín hiệu sống (Heartbeat) định kỳ từ client."""
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -531,12 +539,14 @@ def record_heartbeat(mac_address: str, ip_address: str, logged_in_user: str = ""
         is_online = 1,
         agent_health = 'ONLINE',
         port_ok = 1,
+        client_version = COALESCE(NULLIF(:client_version, ''), client_version),
         ip_address = COALESCE(NULLIF(:ip_address, ''), ip_address),
         logged_in_user = COALESCE(NULLIF(:logged_in_user, ''), logged_in_user),
         boot_time = COALESCE(NULLIF(:boot_time, ''), boot_time)
     WHERE mac_address = :mac
     """, {
         "now_str": now_str,
+        "client_version": client_version,
         "ip_address": ip_address,
         "logged_in_user": logged_in_user,
         "boot_time": boot_time,
@@ -544,6 +554,42 @@ def record_heartbeat(mac_address: str, ip_address: str, logged_in_user: str = ""
     })
     conn.commit()
     conn.close()
+
+
+def get_setting(key: str, default: str = "") -> str:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM system_settings WHERE key = ?", (key,))
+    row = cursor.fetchone()
+    conn.close()
+    return row["value"] if row and row["value"] is not None else default
+
+
+def set_setting(key: str, value: str):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute("""
+    INSERT INTO system_settings (key, value, updated_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+    """, (key, value, now_str))
+    conn.commit()
+    conn.close()
+
+
+def get_outdated_computers(target_version: str) -> List[Dict[str, Any]]:
+    """Lấy danh sách các máy có client_version khác với phiên bản mục tiêu."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT mac_address, ip_address, hostname, client_agent_port, client_version, is_online
+    FROM computers
+    WHERE COALESCE(NULLIF(client_version, ''), '1.3.0') != ?
+    """, (target_version,))
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 def get_computer_by_mac(mac_address: str) -> Optional[Dict[str, Any]]:

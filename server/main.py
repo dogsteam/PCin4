@@ -122,6 +122,11 @@ class RemoteUpdatePayload(BaseModel):
     url: Optional[str] = ""
 
 
+class RemoteUpdateAllPayload(BaseModel):
+    target_version: str = "1.3.1"
+    url: Optional[str] = ""
+
+
 class RemotePingPayload(BaseModel):
     mac_address: Optional[str] = ""
     ip_address: Optional[str] = ""
@@ -152,14 +157,30 @@ OFFLINE_THRESHOLD_SECONDS = 720    # 12 phút không có tín hiệu mới đán
 @app.post("/api/heartbeat", tags=["Client API"])
 def receive_heartbeat(data: HeartbeatPayload):
     try:
-        database.record_heartbeat(data.mac_address, data.ip_address, data.logged_in_user or "", data.uptime_hours or 0.0, data.boot_time or "")
+        client_ver = (data.client_version or "").strip()
+        database.record_heartbeat(
+            data.mac_address,
+            data.ip_address,
+            data.logged_in_user or "",
+            data.uptime_hours or 0.0,
+            data.boot_time or "",
+            client_ver
+        )
         # Kiểm tra và trả về ngay các lệnh đang chờ (Thông báo / Cập nhật)
         pending_cmds = database.get_pending_commands(data.mac_address)
-        return {
+        target_ver = database.get_setting("target_client_version", "").strip()
+        resp_data = {
             "status": "success",
             "heartbeat_interval": HEARTBEAT_INTERVAL_SECONDS,
+            "target_client_version": target_ver,
             "commands": pending_cmds
         }
+        if target_ver and client_ver and client_ver != target_ver:
+            resp_data["update_url"] = database.get_setting("target_client_url", "http://10.10.12.188:8000/in4.exe")
+            sha = _get_local_in4_sha256()
+            if sha:
+                resp_data["update_sha256"] = sha
+        return resp_data
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Lỗi heartbeat: {str(e)}")
 
@@ -306,6 +327,74 @@ def remote_update(req: RemoteUpdatePayload):
         "direct_delivered": direct_ok,
         "queued": True,
         "sha256": sha256_hash
+    }
+
+
+@app.post("/api/remote/update-all", tags=["Điều khiển từ xa"])
+def remote_update_all(req: RemoteUpdateAllPayload):
+    import urllib.request
+    import json
+    from concurrent.futures import ThreadPoolExecutor
+
+    target_ver = (req.target_version or "1.3.1").strip()
+    update_file_url = (req.url or "").strip() or "http://10.10.12.188:8000/in4.exe"
+    sha256_hash = _get_local_in4_sha256() if update_file_url.rstrip("/").endswith("/in4.exe") else ""
+
+    # Lưu phiên bản mục tiêu (Desired State) để các máy bật sau / tương lai tự đối chiếu
+    database.set_setting("target_client_version", target_ver)
+    database.set_setting("target_client_url", update_file_url)
+
+    outdated = database.get_outdated_computers(target_ver)
+    if not outdated:
+        return {
+            "status": "success",
+            "target_version": target_ver,
+            "outdated_count": 0,
+            "direct_delivered": 0,
+            "queued_count": 0,
+            "message": f"✓ Toàn bộ máy trạm đã ở phiên bản {target_ver}!"
+        }
+
+    cmd_payload = {"url": update_file_url}
+    if sha256_hash:
+        cmd_payload["sha256"] = sha256_hash
+
+    def _push_one(pc: dict) -> bool:
+        mac = pc.get("mac_address", "")
+        ip = pc.get("ip_address", "")
+        port = int(pc.get("client_agent_port") or 8005)
+        cmd_id = database.queue_command(mac, "update", cmd_payload) if mac else None
+        if ip and pc.get("is_online"):
+            try:
+                target_url = f"http://{ip}:{port}/update"
+                payload = json.dumps(cmd_payload).encode("utf-8")
+                r = urllib.request.Request(target_url, data=payload, headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(r, timeout=1.5) as resp:
+                    res_data = json.loads(resp.read().decode("utf-8"))
+                    if res_data.get("status") == "success":
+                        if cmd_id:
+                            database.ack_command(cmd_id)
+                        return True
+            except Exception:
+                pass
+        return False
+
+    direct_ok_count = 0
+    with ThreadPoolExecutor(max_workers=15) as executor:
+        for ok in executor.map(_push_one, outdated):
+            if ok:
+                direct_ok_count += 1
+
+    return {
+        "status": "success",
+        "target_version": target_ver,
+        "outdated_count": len(outdated),
+        "direct_delivered": direct_ok_count,
+        "queued_count": len(outdated) - direct_ok_count,
+        "message": (
+            f"✓ Đã đặt phiên bản mục tiêu v{target_ver} cho {len(outdated)} máy chưa cập nhật "
+            f"({direct_ok_count} máy nhận tức thì qua Port 8005, {len(outdated) - direct_ok_count} máy chờ nhận qua Heartbeat/khi bật máy)."
+        )
     }
 
 
@@ -949,6 +1038,9 @@ def web_dashboard():
                                 </select>
                             </div>
                             <div class="col-md-3 text-end">
+                                <button class="btn btn-sm btn-outline-success fw-bold me-1" onclick="updateAllClients()" id="btn-update-all" title="Phát hành bản in4.exe mới cho tất cả máy chưa cập nhật">
+                                    <i class="bi bi-cloud-arrow-up me-1"></i>Update All
+                                </button>
                                 <button class="btn btn-sm btn-outline-primary fw-bold me-2" onclick="pingAllDevices()" id="btn-ping-all" title="Gửi gói kiểm tra và làm mới trạng thái toàn viện">
                                     <i class="bi bi-broadcast-pin me-1"></i>⚡ Ping toàn viện
                                 </button>
@@ -1573,6 +1665,20 @@ def web_dashboard():
                     } else {
                         alert('✗ Lỗi gửi lệnh cập nhật: ' + (result.detail || 'Không kết nối được'));
                     }
+                } catch(e) { alert('Lỗi kết nối máy chủ: ' + e); }
+            }
+
+            async function updateAllClients() {
+                const targetVer = prompt('Nhập phiên bản Client mục tiêu (Desired State) muốn phát hành cho toàn viện:', '1.3.1');
+                if (!targetVer || !targetVer.trim()) return;
+                try {
+                    const res = await fetch('/api/remote/update-all', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ target_version: targetVer.trim() })
+                    });
+                    const result = await res.json();
+                    alert(result.message || '✓ Đã phát hành lệnh cập nhật toàn viện!');
                 } catch(e) { alert('Lỗi kết nối máy chủ: ' + e); }
             }
 

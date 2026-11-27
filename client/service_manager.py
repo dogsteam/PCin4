@@ -27,7 +27,7 @@ from typing import Optional
 
 DEFAULT_SERVER_URL = "http://10.10.12.188:8000"
 CLIENT_AGENT_PORT = 8005
-CLIENT_VERSION = "1.3.0"
+CLIENT_VERSION = "1.3.1"
 DEFAULT_HEARTBEAT_INTERVAL = 300  # 5 phút/lần (tối ưu cho quy mô 800 máy)
 
 _MUTEX_HANDLE = None
@@ -605,6 +605,7 @@ def send_heartbeat(mac: str, ip: str, server_url: str) -> Optional[int]:
             data = json.loads(body)
             # Xử lý các lệnh từ Server (thông báo / update)
             commands = data.get("commands", [])
+            has_update_cmd = False
             for cmd in commands:
                 cmd_id = cmd.get("command_id")
                 cmd_type = cmd.get("type")
@@ -613,10 +614,21 @@ def send_heartbeat(mac: str, ip: str, server_url: str) -> Optional[int]:
                     show_client_notification(pl.get("title", "THÔNG BÁO TỪ PHÒNG CNTT"), pl.get("message", ""))
                     ack_server_command(cmd_id, server_url)
                 elif cmd_type == "update":
+                    has_update_cmd = True
                     update_url = pl.get("url") or f"{server_url.rstrip('/')}/in4.exe"
                     expected_sha = pl.get("sha256", "")
                     ack_server_command(cmd_id, server_url)
                     perform_self_update(update_url, expected_sha)
+
+            # Cơ chế Desired State: tự động đồng bộ nếu phiên bản mục tiêu trên Server khác CLIENT_VERSION
+            target_ver = (data.get("target_client_version") or "").strip()
+            if not has_update_cmd and target_ver and target_ver != CLIENT_VERSION:
+                update_url = data.get("update_url") or f"{server_url.rstrip('/')}/in4.exe"
+                expected_sha = data.get("update_sha256", "")
+                delay = random.randint(2, 45)
+                log_sync(f">>> Desired State: Server yêu cầu v{target_ver} (hiện tại v{CLIENT_VERSION}). Chờ {delay}s rồi tự cập nhật...")
+                time.sleep(delay)
+                perform_self_update(update_url, expected_sha)
 
             srv_interval = data.get("heartbeat_interval")
             if isinstance(srv_interval, int) and 15 <= srv_interval <= 3600:

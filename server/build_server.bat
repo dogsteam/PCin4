@@ -29,4 +29,4 @@ echo   [BUILD COMPLETE] PCin4Server.exe da duoc tao thanh cong!
 echo   - server\PCin4Server.exe
 echo   - PCin4Server.exe (root project folder)
 echo ===================================================================
-pause
+if /I not "%~1"=="--nopause" pause

@@ -932,7 +932,7 @@ class BridgeApi:
             payload["logged_in_user"] = service_manager.get_logged_in_user()
             payload["boot_time"] = boot_str
             payload["client_agent_port"] = 8005
-            payload["client_version"] = "1.3.0"
+            payload["client_version"] = "1.3.1"
         except Exception:
             pass
 

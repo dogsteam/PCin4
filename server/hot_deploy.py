@@ -128,10 +128,11 @@ def start_hot_deploy_server(base_dir: str, app_port: int = 8000):
                 self._send_json(404, {"error": "Not Found"})
 
         def do_POST(self):
-            if self.path != "/deploy":
+            if self.path not in ("/deploy", "/deploy-client"):
                 self._send_json(404, {"error": "Not Found"})
                 return
 
+            is_client_deploy = (self.path == "/deploy-client")
             expected_sha = self.headers.get("X-File-SHA256", "").strip().lower()
             if not expected_sha or not _verify_auth(self.headers, deploy_secret, expected_sha):
                 self._send_json(401, {"status": "error", "message": "Xác thực Secret Key / HMAC thất bại!"})
@@ -142,9 +143,14 @@ def start_hot_deploy_server(base_dir: str, app_port: int = 8000):
                 self._send_json(400, {"status": "error", "message": "Thiếu Content-Length hoặc file rỗng!"})
                 return
 
-            target_exe = os.path.join(base_dir, "PCin4Server.exe")
-            old_exe = os.path.join(base_dir, "PCin4Server.old")
-            temp_exe = os.path.join(base_dir, "PCin4Server_new.tmp")
+            if is_client_deploy:
+                target_exe = os.path.join(base_dir, "in4.exe")
+                old_exe = os.path.join(base_dir, "in4_server_bak.old")
+                temp_exe = os.path.join(base_dir, "in4_upload.tmp")
+            else:
+                target_exe = os.path.join(base_dir, "PCin4Server.exe")
+                old_exe = os.path.join(base_dir, "PCin4Server.old")
+                temp_exe = os.path.join(base_dir, "PCin4Server_new.tmp")
 
             try:
                 h = hashlib.sha256()
@@ -191,13 +197,21 @@ def start_hot_deploy_server(base_dir: str, app_port: int = 8000):
                             pass
                     raise swap_err
 
-                self._send_json(200, {
-                    "status": "success",
-                    "message": "✓ Đã nhận PCin4Server.exe mới, đang khởi động lại dịch vụ...",
-                    "sha256": actual_sha,
-                    "bytes": content_len
-                })
-                threading.Thread(target=_restart_server_later, args=(target_exe, app_port), daemon=True).start()
+                if is_client_deploy:
+                    self._send_json(200, {
+                        "status": "success",
+                        "message": "✓ Đã cập nhật in4.exe lên thư mục Server!",
+                        "sha256": actual_sha,
+                        "bytes": content_len
+                    })
+                else:
+                    self._send_json(200, {
+                        "status": "success",
+                        "message": "✓ Đã nhận PCin4Server.exe mới, đang khởi động lại dịch vụ...",
+                        "sha256": actual_sha,
+                        "bytes": content_len
+                    })
+                    threading.Thread(target=_restart_server_later, args=(target_exe, app_port), daemon=True).start()
             except Exception as e:
                 if os.path.exists(temp_exe):
                     try:
