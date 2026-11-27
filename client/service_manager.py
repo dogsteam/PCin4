@@ -12,6 +12,7 @@ import sys
 import json
 import shutil
 import hashlib
+import random
 import subprocess
 import winreg
 import time
@@ -22,10 +23,12 @@ import threading
 import getpass
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta
+from typing import Optional
 
 DEFAULT_SERVER_URL = "http://10.10.12.188:8000"
 CLIENT_AGENT_PORT = 8005
 CLIENT_VERSION = "1.3.0"
+DEFAULT_HEARTBEAT_INTERVAL = 300  # 5 phút/lần (tối ưu cho quy mô 800 máy)
 
 _MUTEX_HANDLE = None
 
@@ -581,8 +584,8 @@ def ack_server_command(cmd_id: int, server_url: str):
         pass
 
 
-def send_heartbeat(mac: str, ip: str, server_url: str):
-    """Gửi tín hiệu sống định kỳ (Heartbeat) & tiếp nhận lệnh điều khiển/thông báo từ Server."""
+def send_heartbeat(mac: str, ip: str, server_url: str) -> Optional[int]:
+    """Gửi tín hiệu sống định kỳ (Heartbeat) & tiếp nhận lệnh điều khiển/chu kỳ mới từ Server."""
     try:
         api_url = f"{server_url.rstrip('/')}/api/heartbeat"
         boot_str, uptime_h = get_boot_info()
@@ -597,7 +600,7 @@ def send_heartbeat(mac: str, ip: str, server_url: str):
         }
         req_data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(api_url, data=req_data, headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=3) as resp:
+        with urllib.request.urlopen(req, timeout=5) as resp:
             body = resp.read().decode("utf-8")
             data = json.loads(body)
             # Xử lý các lệnh từ Server (thông báo / update)
@@ -614,8 +617,13 @@ def send_heartbeat(mac: str, ip: str, server_url: str):
                     expected_sha = pl.get("sha256", "")
                     ack_server_command(cmd_id, server_url)
                     perform_self_update(update_url, expected_sha)
+
+            srv_interval = data.get("heartbeat_interval")
+            if isinstance(srv_interval, int) and 15 <= srv_interval <= 3600:
+                return srv_interval
     except Exception:
         pass
+    return None
 
 
 def send_telemetry(hw_data: dict, meta: dict, server_url: str) -> bool:
@@ -701,26 +709,32 @@ def run_silent_background_agent():
             log_sync(f"[Lần thử {attempt}/3] Chưa thể gửi về {server_url}: {err}")
             time.sleep(15)
 
-    # Vòng lặp duy trì: gửi heartbeat mỗi 5 giây (0% CPU, nhận lệnh từ server ngay tức thì)
-    # và quét lại phần cứng mỗi 4 tiếng
-    heartbeat_counter = 0
+    # Vòng lặp duy trì: gửi heartbeat mặc định mỗi 5 phút (tự điều chỉnh theo server)
+    # Kèm jitter ngẫu nhiên 0-30s để 800 máy không dội về cùng 1 giây, và quét lại phần cứng mỗi 4 tiếng
+    heartbeat_interval = DEFAULT_HEARTBEAT_INTERVAL
+    last_telemetry_ts = time.time()
+    time.sleep(random.randint(0, 30))
+
     while True:
         try:
-            time.sleep(5) # 5 giây
-            heartbeat_counter += 1
             meta = load_saved_agent_config()
             server_url = meta.get("server_url", DEFAULT_SERVER_URL)
 
             # Gửi heartbeat định kỳ để server biết máy đang BẬT và nhận lệnh chờ
-            send_heartbeat(mac, ip, server_url)
+            new_interval = send_heartbeat(mac, ip, server_url)
+            if new_interval:
+                heartbeat_interval = new_interval
 
-            # Mỗi 4 tiếng (2880 chu kỳ x 5s) quét lại phần cứng toàn diện
-            if heartbeat_counter >= 2880:
-                heartbeat_counter = 0
+            # Mỗi 4 tiếng (14400 giây) quét lại phần cứng toàn diện
+            if time.time() - last_telemetry_ts >= 14400:
+                last_telemetry_ts = time.time()
                 hw_data = hardware_collector.collect_all_hardware_info()
                 mac = hw_data.get("mac_address", "")
                 ip = hw_data.get("ip_address", "")
                 send_telemetry(hw_data, meta, server_url)
 
+            time.sleep(heartbeat_interval)
+
         except Exception as loop_err:
             log_sync(f"Lỗi vòng lặp nền: {loop_err}")
+            time.sleep(heartbeat_interval)

@@ -19,14 +19,17 @@ DB_PATH = os.path.join(BASE_DIR, "inventory.db")
 
 
 def get_db_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA synchronous = NORMAL")
     return conn
 
 
 def init_db():
     """Khởi tạo bảng computers, hardware_history, power_logs và index nếu chưa tồn tại."""
     conn = get_db_connection()
+    conn.execute("PRAGMA journal_mode = WAL")
     cursor = conn.cursor()
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS computers (
@@ -576,8 +579,8 @@ def record_power_event(mac_address: str, event_type: str, logged_in_user: str = 
     conn.close()
 
 
-def update_online_status_threshold(timeout_seconds: int = 45):
-    """Tự động chuyển các máy không có tín hiệu trong 45 giây thành Offline (Đã tắt)."""
+def update_online_status_threshold(timeout_seconds: int = 720):
+    """Tự động chuyển các máy không có tín hiệu trong 720 giây (12 phút) thành Offline (Đã tắt)."""
     conn = get_db_connection()
     cursor = conn.cursor()
     cutoff = (datetime.now() - timedelta(seconds=timeout_seconds)).strftime("%Y-%m-%d %H:%M:%S")

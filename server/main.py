@@ -145,6 +145,10 @@ def receive_inventory(data: InventoryPayload):
         raise HTTPException(status_code=500, detail=f"Lỗi lưu CSDL: {str(e)}")
 
 
+HEARTBEAT_INTERVAL_SECONDS = 300   # 5 phút/lần (tối ưu cho quy mô ~800 máy)
+OFFLINE_THRESHOLD_SECONDS = 720    # 12 phút không có tín hiệu mới đánh dấu Offline
+
+
 @app.post("/api/heartbeat", tags=["Client API"])
 def receive_heartbeat(data: HeartbeatPayload):
     try:
@@ -153,6 +157,7 @@ def receive_heartbeat(data: HeartbeatPayload):
         pending_cmds = database.get_pending_commands(data.mac_address)
         return {
             "status": "success",
+            "heartbeat_interval": HEARTBEAT_INTERVAL_SECONDS,
             "commands": pending_cmds
         }
     except Exception as e:
@@ -330,7 +335,7 @@ def check_single_device_ping(mac: str, ip: str, port: int = 8005) -> dict:
         try:
             ls_dt = datetime.strptime(str(last_seen)[:19], "%Y-%m-%d %H:%M:%S")
             heartbeat_seconds_ago = round((datetime.now() - ls_dt).total_seconds(), 1)
-            if heartbeat_seconds_ago <= 45.0:
+            if heartbeat_seconds_ago <= float(OFFLINE_THRESHOLD_SECONDS):
                 heartbeat_active = True
         except Exception:
             pass
@@ -1728,5 +1733,15 @@ if __name__ == "__main__":
             except Exception:
                 pass
         threading.Thread(target=auto_open_browser, args=(args.port,), daemon=True).start()
+
+    import logging
+    class _QuietHeartbeatFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            msg = record.getMessage()
+            if "/api/heartbeat" in msg and " 200" in msg:
+                return False
+            return True
+
+    logging.getLogger("uvicorn.access").addFilter(_QuietHeartbeatFilter())
 
     uvicorn.run(app, host=args.host, port=args.port)
