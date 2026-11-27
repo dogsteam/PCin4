@@ -1,16 +1,23 @@
 @echo off
 chcp 65001 >nul
-echo ===================================================================
-echo   [1-CLICK] BUILD CLIENT + SERVER ^& AUTO DEPLOY LEN 10.10.12.188
-echo ===================================================================
-
 set "ROOT_DIR=%~dp0"
-set "LOCAL_RUN_DIR=C:\Users\Admin\Desktop\In4"
 cd /d "%ROOT_DIR%"
 
-echo.
-echo [1/4] Dang cap nhat ma nguon moi nhat tu GitHub...
-git pull origin main
+if /I not "%~1"=="--pulled" (
+    echo ===================================================================
+    echo   [1-CLICK] BUILD CLIENT + SERVER ^& AUTO DEPLOY LEN 10.10.12.188
+    echo ===================================================================
+    echo.
+    echo [1/4] Dang cap nhat ma nguon moi nhat tu GitHub...
+    git pull origin main
+    if errorlevel 1 (
+        echo [LOI] git pull that bai!
+        pause
+        exit /b 1
+    )
+    cmd /c ""%~f0" --pulled"
+    exit /b %errorlevel%
+)
 
 echo.
 echo [2/4] Dang dong goi Client (in4.exe)...
@@ -35,6 +42,7 @@ if errorlevel 1 (
 echo.
 echo [4/4] Dang trien khai ban moi...
 cd /d "%ROOT_DIR%"
+set "LOCAL_RUN_DIR=C:\Users\Admin\Desktop\In4"
 if exist "%LOCAL_RUN_DIR%\inventory.db" (
     echo     Phat hien thu muc may chu: %LOCAL_RUN_DIR%
     if exist "%LOCAL_RUN_DIR%\PCin4Server.old" del /f /q "%LOCAL_RUN_DIR%\PCin4Server.old" >nul 2>&1
