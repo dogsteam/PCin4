@@ -73,8 +73,9 @@ def push_binary(ip: str, port: int, secret: str, endpoint: str, file_path: str, 
 
 
 def main():
-    args = [a for a in sys.argv[1:] if a != "--with-client"]
+    args = [a for a in sys.argv[1:] if a not in ("--with-client", "--client-only")]
     with_client = ("--with-client" in sys.argv)
+    client_only = ("--client-only" in sys.argv)
 
     ip = args[0] if len(args) > 0 else "10.10.12.188"
     port = int(args[1]) if len(args) > 1 else 1994
@@ -83,16 +84,19 @@ def main():
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-    if with_client:
+    if with_client or client_only:
         client_exe = find_file([
             os.path.join(root, "server", "in4.exe"),
             os.path.join(root, "client", "dist", "in4.exe"),
             os.path.join(root, "in4.exe"),
         ])
         if not client_exe:
-            print("✗ Không tìm thấy in4.exe để đẩy kèm (--with-client)!")
+            print("✗ Không tìm thấy in4.exe để đẩy lên Server!")
             sys.exit(1)
         push_binary(ip, port, secret, "/deploy-client", client_exe, "in4.exe (Client)")
+        if client_only:
+            print("✓ Đã cập nhật xong in4.exe lên Server (không cần restart Server)!")
+            return
 
     server_exe = find_file([
         exe_arg,

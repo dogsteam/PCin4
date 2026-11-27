@@ -159,6 +159,19 @@ def init_db():
           WHERE COALESCE(NULLIF(client_version, ''), '1.3.0') = '1.3.0'
       )
     """)
+
+    # Dọn các cảnh báo giả màn hình do tắt/ngủ màn hình (hoặc RDP)
+    cursor.execute("""
+    DELETE FROM hardware_history
+    WHERE component = 'Màn hình'
+      AND (old_value LIKE 'Không phát hiện%' OR new_value LIKE 'Không phát hiện%')
+    """)
+    cursor.execute("""
+    UPDATE computers
+    SET hardware_tampered = 0, tamper_details = ''
+    WHERE hardware_tampered = 1
+      AND mac_address NOT IN (SELECT DISTINCT mac_address FROM hardware_history)
+    """)
     conn.commit()
     conn.close()
 
@@ -208,11 +221,16 @@ def upsert_computer(data: Dict[str, Any]) -> int:
         if old_cpu and new_cpu and old_cpu != new_cpu:
             changes.append(("CPU", old_cpu, new_cpu))
 
-        # So sánh Màn hình
+        # So sánh Màn hình (bỏ qua nếu một trong hai vế là "Không phát hiện..." do tắt màn hình / ngủ / RDP)
         old_mon = str(existing["monitors_details"] or "").strip()
         new_mon = str(data.get("monitors_details") or "").strip()
-        if old_mon and new_mon and old_mon != new_mon:
+        old_mon_real = bool(old_mon) and not old_mon.startswith("Không phát hiện")
+        new_mon_real = bool(new_mon) and not new_mon.startswith("Không phát hiện")
+        if old_mon_real and new_mon_real and old_mon != new_mon:
             changes.append(("Màn hình", old_mon, new_mon))
+        elif old_mon_real and not new_mon_real:
+            # Giữ lại thông tin màn hình thật cũ thay vì ghi đè bằng "Không phát hiện..."
+            data["monitors_details"] = old_mon
 
         if changes:
             hardware_tampered = 1
