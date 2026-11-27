@@ -20,6 +20,12 @@ pyinstaller --noconfirm --onefile --console --name "PCin4Server" ^
     --workpath "build" ^
     main.py
 
+if errorlevel 1 (
+    echo [LOI] Build PCin4Server.exe that bai!
+    if /I not "%~1"=="--nopause" pause
+    exit /b 1
+)
+
 copy /y "dist\PCin4Server.exe" "PCin4Server.exe" >nul
 copy /y "dist\PCin4Server.exe" "..\PCin4Server.exe" >nul
 

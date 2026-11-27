@@ -22,7 +22,7 @@ if not errorlevel 1 (
         --assume-yes-for-downloads ^
         --windows-console-mode=disable ^
         --windows-icon-from-ico=app_icon.ico ^
-        --onefile-tempdir-spec="{CACHE_DIR}/IN4_Agent/rt_1_3_1" ^
+        --onefile-tempdir-spec="{CACHE_DIR}/IN4_Agent/rt_1_3_2" ^
         --enable-plugin=pywebview ^
         --include-package=encodings ^
         --include-package=webview ^
