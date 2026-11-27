@@ -317,8 +317,12 @@ def remote_update(req: RemoteUpdatePayload):
     if mac:
         cmd_id = database.queue_command(mac, "update", cmd_payload)
 
+    pc_info = database.get_computer_by_mac(mac) if mac else None
+    cur_ver = (pc_info.get("client_version") or "1.3.0").strip() if pc_info else "1.3.0"
+
     direct_ok = False
-    if req.ip_address:
+    # Chỉ đẩy trực tiếp qua port 8005 với client >= 1.3.1 (v1.3.0 phải nhận qua Heartbeat Main Thread để tránh taskkill /T)
+    if req.ip_address and cur_ver != "1.3.0":
         try:
             target_url = f"http://{req.ip_address}:{req.port or 8005}/update"
             payload = json.dumps(cmd_payload).encode("utf-8")
@@ -360,8 +364,9 @@ def _dispatch_update_to_devices(devices: list, update_file_url: str, sha256_hash
         mac = pc.get("mac_address", "")
         ip = pc.get("ip_address", "")
         port = int(pc.get("client_agent_port") or 8005)
+        cur_ver = (pc.get("client_version") or "1.3.0").strip()
         cmd_id = database.queue_command(mac, "update", cmd_payload) if mac else None
-        if ip and pc.get("is_online"):
+        if ip and pc.get("is_online") and cur_ver != "1.3.0":
             try:
                 target_url = f"http://{ip}:{port}/update"
                 payload = json.dumps(cmd_payload).encode("utf-8")

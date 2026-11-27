@@ -10,6 +10,12 @@ Quản lý chế độ chạy nền (Background Service) và Tự khởi động
 import os
 import sys
 import json
+import encodings.idna
+import encodings.utf_8
+import encodings.ascii
+import encodings.latin_1
+import encodings.cp1252
+import encodings.cp437
 import shutil
 import hashlib
 import random

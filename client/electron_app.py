@@ -12,6 +12,9 @@ import html
 import json
 import os
 import sys
+import encodings.idna
+import encodings.utf_8
+import encodings.ascii
 import threading
 import urllib.request
 import urllib.error

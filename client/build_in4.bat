@@ -24,12 +24,14 @@ if not errorlevel 1 (
         --windows-icon-from-ico=app_icon.ico ^
         --onefile-tempdir-spec="{CACHE_DIR}/IN4_Agent/rt_1_3_1" ^
         --enable-plugin=pywebview ^
+        --include-package=encodings ^
         --include-package=webview ^
         --include-package=pythonnet ^
         --include-package=clr_loader ^
         --include-package-data=webview ^
         --include-package-data=pythonnet ^
         --include-package-data=clr_loader ^
+        --include-module=encodings.idna ^
         --include-module=service_manager ^
         --include-module=hardware_collector ^
         --include-data-files=config.json=config.json ^
@@ -56,6 +58,8 @@ if "%BUILD_OK%"=="0" (
         --add-data "config.json;." ^
         --add-data "icon_b64.txt;." ^
         --add-data "app_icon.png;." ^
+        --hidden-import "encodings" ^
+        --hidden-import "encodings.idna" ^
         --hidden-import "service_manager" ^
         --hidden-import "hardware_collector" ^
         --distpath "dist" ^
