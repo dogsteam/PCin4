@@ -244,6 +244,50 @@ def ensure_defender_exclusion(target_dir: str = None) -> bool:
     return False
 
 
+def ensure_watchdog_task(target_exe: str = None) -> bool:
+    """
+    Đăng ký Windows Scheduled Task lặp lại mỗi 15 phút để tự hồi sinh in4.exe --silent
+    nếu tiến trình chạy nền bị tắt đột ngột giữa ngày.
+    """
+    if sys.platform != "win32":
+        return False
+
+    agent_dir = get_agent_dir()
+    marker_file = os.path.join(agent_dir, ".watchdog_v1")
+    if os.path.exists(marker_file):
+        return True
+
+    exe_path = target_exe or os.path.join(agent_dir, "in4.exe")
+    if not os.path.exists(exe_path):
+        return False
+
+    try:
+        CREATE_NO_WINDOW = 0x08000000
+        cmd = [
+            "schtasks", "/create",
+            "/tn", "IN4_Agent_Watchdog",
+            "/tr", f'"{exe_path}" --silent',
+            "/sc", "minute",
+            "/mo", "15",
+            "/f"
+        ]
+        if is_user_admin():
+            cmd.extend(["/rl", "highest"])
+
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=10, creationflags=CREATE_NO_WINDOW)
+        if res.returncode == 0:
+            try:
+                with open(marker_file, "w", encoding="utf-8") as f:
+                    f.write(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            except Exception:
+                pass
+            log_sync("✓ Đã đăng ký Task Watchdog tự hồi sinh mỗi 15 phút (IN4_Agent_Watchdog).")
+            return True
+    except Exception as e:
+        log_sync(f"⚠ Không thể tạo Task Watchdog: {e}")
+    return False
+
+
 def cleanup_old_update_files():
     """Dọn dẹp file .old / .tmp còn sót lại sau khi tự cập nhật thành công."""
     try:
@@ -306,12 +350,13 @@ def install_auto_start(metadata: dict = None) -> bool:
         except Exception as reg_err:
             log_sync(f"Lỗi đăng ký Registry Run: {reg_err}")
 
-        # 4. Xóa Task Scheduler cũ nếu có (tránh lỗi Task Scheduler nuốt cờ --silent gây mở UI)
+        # 4. Xóa Task Scheduler cũ nếu có và đăng ký Watchdog tự hồi sinh mỗi 15 phút
         CREATE_NO_WINDOW = 0x08000000
         try:
             subprocess.run(["schtasks", "/delete", "/tn", "IN4_Hardware_Agent", "/f"], capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
         except Exception:
             pass
+        ensure_watchdog_task(target_exe)
 
         # 5. Mở port Windows Firewall cho kết nối cập nhật / nhận thông báo từ máy chủ
         try:
@@ -726,10 +771,11 @@ def run_silent_background_agent():
     log_sync("==================================================")
     log_sync(">>> IN4 Silent Agent đã khởi động cùng Windows...")
 
-    # 0. Dọn file .old sau update & đảm bảo Defender Exclusion nếu đang có quyền Admin
+    # 0. Dọn file .old sau update, đảm bảo Defender Exclusion & Task Watchdog 15 phút
     time.sleep(1.5)
     cleanup_old_update_files()
     ensure_defender_exclusion()
+    ensure_watchdog_task()
 
     # 1. Mở ngay cổng lắng nghe từ xa 8005 (cho phép nhận thông báo / update từ server)
     start_client_remote_server(CLIENT_AGENT_PORT)
