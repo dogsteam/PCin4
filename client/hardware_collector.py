@@ -1,5 +1,6 @@
 import ctypes
 from ctypes import wintypes
+import csv
 import math
 import os
 import platform
@@ -214,52 +215,68 @@ def get_monitors_info() -> str:
     return "; ".join(items)
 
 
+def _is_valid_hw_serial(sn: str) -> bool:
+    """Kiểm tra serial phần cứng có hợp lệ (loại bỏ serial mặc định/trống như 00000000, Unknown)."""
+    raw = str(sn or "").strip()
+    if not raw:
+        return False
+    clean = re.sub(r'[^A-Za-z0-9]', '', raw).upper()
+    if len(clean) < 4 or len(set(clean)) <= 1:
+        return False
+    if clean in {
+        "UNKNOWN", "UNDEFINED", "NONE", "NULL", "NA", "EMPTY", "OEM",
+        "SERIALNUM", "SERNUM00", "DEFAULTSTRING", "TOBEFILLEDBYOEM",
+        "NOTSPECIFIED", "SYSTEMSERIALNUMBER", "01234567", "12345678",
+        "0123456789", "123456789", "1234567890", "ABCDEF12"
+    }:
+        return False
+    if re.match(r'^0+000[1-9]$', clean):
+        return False
+    return True
+
+
+def _parse_wmic_csv(stdout: str) -> List[Dict[str, str]]:
+    """Parse đầu ra CSV của wmic an toàn (xử lý được dấu phẩy trong tên hãng)."""
+    rows: List[Dict[str, str]] = []
+    lines = [l.strip() for l in (stdout or "").strip().splitlines() if l.strip()]
+    if len(lines) <= 1:
+        return rows
+    headers = [h.strip() for h in next(csv.reader([lines[0]]))]
+    for line in lines[1:]:
+        parts = next(csv.reader([line]))
+        if len(parts) >= len(headers):
+            rows.append(dict(zip(headers, [p.strip() for p in parts])))
+    return rows
+
+
 def query_wmi_via_cmd() -> Dict[str, Any]:
     """Fallback dùng Command Prompt (wmic) hoàn toàn ẩn khi máy trạm không có hoặc bị cấm PowerShell."""
     CREATE_NO_WINDOW = 0x08000000
     data = {"Rams": [], "RamSlots": 2, "Disks": [], "Net": [], "Keyboards": [], "Mice": []}
     try:
-        # 1. RAM qua WMIC
+        # 1. RAM qua WMIC (kèm SerialNumber để truy vết chuyển linh kiện)
         res = subprocess.run(
-            ["cmd.exe", "/c", "wmic memorychip get DeviceLocator,Capacity,Speed,Manufacturer,PartNumber /format:csv"],
-            capture_output=True, text=True, timeout=5, creationflags=CREATE_NO_WINDOW
+            ["cmd.exe", "/c", "wmic memorychip get DeviceLocator,Capacity,Speed,Manufacturer,PartNumber,SerialNumber /format:csv"],
+            capture_output=True, text=True, timeout=10, creationflags=CREATE_NO_WINDOW
         )
         if res.returncode == 0 and res.stdout.strip():
-            lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip()]
-            if len(lines) > 1:
-                headers = [h.strip() for h in lines[0].split(",")]
-                for line in lines[1:]:
-                    parts = line.split(",")
-                    if len(parts) >= len(headers):
-                        data["Rams"].append(dict(zip(headers, [p.strip() for p in parts])))
+            data["Rams"] = _parse_wmic_csv(res.stdout)
 
         # 2. Ổ cứng qua WMIC
         res_disk = subprocess.run(
             ["cmd.exe", "/c", "wmic diskdrive get Model,MediaType,InterfaceType,Size,SerialNumber /format:csv"],
-            capture_output=True, text=True, timeout=5, creationflags=CREATE_NO_WINDOW
+            capture_output=True, text=True, timeout=10, creationflags=CREATE_NO_WINDOW
         )
         if res_disk.returncode == 0 and res_disk.stdout.strip():
-            lines = [l.strip() for l in res_disk.stdout.strip().splitlines() if l.strip()]
-            if len(lines) > 1:
-                headers = [h.strip() for h in lines[0].split(",")]
-                for line in lines[1:]:
-                    parts = line.split(",")
-                    if len(parts) >= len(headers):
-                        data["Disks"].append(dict(zip(headers, [p.strip() for p in parts])))
+            data["Disks"] = _parse_wmic_csv(res_disk.stdout)
 
         # 3. Card mạng qua WMIC
         res_net = subprocess.run(
             ["cmd.exe", "/c", "wmic nicconfig where IPEnabled=True get Description,IPAddress,MACAddress /format:csv"],
-            capture_output=True, text=True, timeout=5, creationflags=CREATE_NO_WINDOW
+            capture_output=True, text=True, timeout=10, creationflags=CREATE_NO_WINDOW
         )
         if res_net.returncode == 0 and res_net.stdout.strip():
-            lines = [l.strip() for l in res_net.stdout.strip().splitlines() if l.strip()]
-            if len(lines) > 1:
-                headers = [h.strip() for h in lines[0].split(",")]
-                for line in lines[1:]:
-                    parts = line.split(",")
-                    if len(parts) >= len(headers):
-                        data["Net"].append(dict(zip(headers, [p.strip() for p in parts])))
+            data["Net"] = _parse_wmic_csv(res_net.stdout)
     except Exception:
         pass
     return data
@@ -269,7 +286,7 @@ def get_combined_wmi_data() -> Dict[str, Any]:
     """Truy vấn siêu tốc các thông số WMI bằng PowerShell ẩn 100%, tự động fallback Command Prompt."""
     CREATE_NO_WINDOW = 0x08000000
     ps_script = """
-    $rams = @(Get-CimInstance Win32_PhysicalMemory -ErrorAction SilentlyContinue | Select-Object DeviceLocator, Capacity, Speed, Manufacturer, PartNumber)
+    $rams = @(Get-CimInstance Win32_PhysicalMemory -ErrorAction SilentlyContinue | Select-Object DeviceLocator, Capacity, Speed, Manufacturer, PartNumber, SerialNumber)
     $ramSlots = (Get-CimInstance Win32_PhysicalMemoryArray -ErrorAction SilentlyContinue | Select-Object -First 1).MemoryDevices
     $disks = @(Get-CimInstance Win32_DiskDrive -ErrorAction SilentlyContinue | Select-Object Model, MediaType, InterfaceType, Size, SerialNumber)
     $net = @(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' -ErrorAction SilentlyContinue | Select-Object Description, IPAddress, MACAddress)
@@ -291,7 +308,7 @@ def get_combined_wmi_data() -> Dict[str, Any]:
         # Gọi PowerShell với WindowStyle Hidden và CREATE_NO_WINDOW (tuyệt đối không hiện cửa sổ)
         res = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=12,
             creationflags=CREATE_NO_WINDOW
         )
         if res.returncode == 0 and res.stdout.strip():
@@ -299,8 +316,8 @@ def get_combined_wmi_data() -> Dict[str, Any]:
     except Exception:
         pass
 
-    # Nếu máy không có PowerShell hoặc PowerShell bị lỗi -> Gọi fallback Command Prompt (wmic)
-    if not data or not data.get("Disks"):
+    # Nếu máy không có PowerShell, bị timeout, hoặc thiếu RAM/Disk -> Gọi fallback Command Prompt (wmic)
+    if not data or not data.get("Disks") or not data.get("Rams"):
         cmd_data = query_wmi_via_cmd()
         if cmd_data:
             if not data:
@@ -346,8 +363,10 @@ def format_ram_data(wmi_data: dict) -> Dict[str, Any]:
         speed_str = f" {speed}MHz" if speed else ""
         pn = str(r.get("PartNumber", "")).strip()
         pn_str = f" ({pn})" if pn else ""
+        sn = str(r.get("SerialNumber", "")).strip()
+        sn_str = f" [SN: {sn}]" if _is_valid_hw_serial(sn) else ""
         loc = r.get("DeviceLocator", f"DIMM {idx}")
-        stick_details.append(f"Thanh {idx} [{loc}]: {mfg} {cap_gb}GB{speed_str}{pn_str}")
+        stick_details.append(f"Thanh {idx} [{loc}]: {mfg} {cap_gb}GB{speed_str}{pn_str}{sn_str}")
 
     slots_summary = f"ĐANG CẮM {ram_count} THANH (Tổng {total_gb} GB)"
     if ram_slots and ram_slots >= ram_count:
@@ -381,7 +400,14 @@ def format_disks_data(wmi_data: dict) -> str:
         raw_size = int(d.get('Size', 0) or 0)
         size_gb = round(raw_size / (1000 ** 3))
 
-        if 'NVME' in bus.upper() or 'NVME' in model.upper():
+        is_usb = 'USB' in bus.upper()
+        # Bỏ qua đầu đọc thẻ nhớ rỗng (0 GB) để tránh gây nhiễu danh sách ổ cứng
+        if raw_size <= 0 and (is_usb or 'SD/MMC' in model.upper() or 'READER' in model.upper()):
+            continue
+
+        if is_usb:
+            type_label = 'USB Di động'
+        elif 'NVME' in bus.upper() or 'NVME' in model.upper():
             type_label = 'SSD NVMe'
         elif 'SSD' in model.upper() or 'SOLID STATE' in media.upper():
             type_label = 'SSD'
@@ -393,7 +419,7 @@ def format_disks_data(wmi_data: dict) -> str:
         sn_str = f" [SN: {sn}]" if sn else ""
         items.append(f"[{type_label}] {model} - {size_gb} GB{sn_str}")
 
-    return "; ".join(items)
+    return "; ".join(items) if items else "Ổ cứng cục bộ (N/A)"
 
 
 def format_peripherals(wmi_data: dict) -> Dict[str, str]:

@@ -7,8 +7,9 @@ import sqlite3
 import os
 import sys
 import json
+import re
 from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 if getattr(sys, 'frozen', False):
     BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
@@ -119,6 +120,22 @@ def init_db():
     )
     """)
 
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS component_registry (
+        component_type TEXT NOT NULL,
+        serial_number TEXT NOT NULL,
+        component_desc TEXT,
+        mac_address TEXT NOT NULL,
+        hostname TEXT,
+        department TEXT,
+        user_name TEXT,
+        first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (component_type, serial_number)
+    )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_comp_reg_mac ON component_registry(mac_address);")
+
     # Migration thêm cột nếu bảng computers đã có từ trước
     migrations = [
         ("barcode", "TEXT"),
@@ -160,20 +177,281 @@ def init_db():
       )
     """)
 
-    # Dọn các cảnh báo giả màn hình do tắt/ngủ màn hình (hoặc RDP)
+    # Dọn các cảnh báo giả màn hình do tắt/ngủ màn hình (hoặc RDP) & WMI timeout N/A
+    _restore_and_clean_false_alerts(cursor)
+
+    # Nâng target_client_version mặc định 1.3.1 -> 1.3.2 nếu admin chưa tự đặt bản cao hơn
+    cursor.execute("""
+    UPDATE system_settings
+    SET value = '1.3.2'
+    WHERE key = 'target_client_version' AND value = '1.3.1'
+    """)
+
+    # Đồng bộ component_registry từ dữ liệu máy tính hiện có (máy online/cập nhật mới nhất giữ quyền sở hữu serial)
+    _backfill_component_registry(cursor)
+
+    conn.commit()
+    conn.close()
+
+
+_INVALID_HW_SERIALS = {
+    "UNKNOWN", "UNDEFINED", "NONE", "NULL", "NA", "EMPTY", "OEM",
+    "SERIALNUM", "SERNUM00", "DEFAULTSTRING", "TOBEFILLEDBYOEM",
+    "NOTSPECIFIED", "SYSTEMSERIALNUMBER", "01234567", "12345678",
+    "0123456789", "123456789", "1234567890", "ABCDEF12", "1234ABCD",
+    "2012062914345300",  # Generic SD/MMC card reader firmware SN
+    "MV238FHMN20",       # Generic monitor panel model reported as SN
+}
+
+
+def _is_valid_hardware_serial(sn: str) -> bool:
+    """Xác thực serial phần cứng có tính duy nhất để truy vết tráo linh kiện."""
+    raw = str(sn or "").strip()
+    if not raw:
+        return False
+    clean = re.sub(r'[^A-Za-z0-9]', '', raw).upper()
+    if len(clean) < 6 or len(set(clean)) <= 1:
+        return False
+    if clean in _INVALID_HW_SERIALS:
+        return False
+    if re.match(r'^0+000[1-9]$', clean):
+        return False
+    return True
+
+
+def _strip_ram_sn(ram_str: str) -> str:
+    """Loại bỏ [SN: ...] và chuẩn hóa khoảng trắng để so sánh tương thích v1.3.0/1.3.1 -> v1.3.2."""
+    return re.sub(r'\s+', ' ', re.sub(r'\s*\[SN:\s*[^\]]+\]', '', str(ram_str or ''))).strip()
+
+
+def _is_empty_card_reader_item(seg: str) -> bool:
+    u = seg.upper()
+    return ("- 0 GB" in u) and ("SD/MMC" in u or "GENERIC-" in u or "READER" in u or "USB DEVICE" in u)
+
+
+def _split_storage_items(disk_str: str) -> Tuple[List[str], List[str]]:
+    """Tách ổ cứng nội bộ và ổ cứng di động / USB (>0 GB), bỏ qua đầu đọc thẻ 0 GB."""
+    raw = str(disk_str or "").strip()
+    if not raw or raw == "Ổ cứng cục bộ (N/A)":
+        return [], []
+    internal, usb = [], []
+    for part in raw.split(";"):
+        seg = part.strip()
+        if not seg or seg == "Ổ cứng cục bộ (N/A)" or _is_empty_card_reader_item(seg):
+            continue
+        if seg.startswith("[USB Di động]"):
+            usb.append(seg)
+        else:
+            internal.append(seg)
+    return internal, usb
+
+
+def _extract_component_serials(
+    storage_details: str,
+    monitors_details: str,
+    ram_details: str
+) -> List[Tuple[str, str, str]]:
+    """Trích xuất các cặp (loại linh kiện, SERIAL_CHUẨN, mô tả) từ chuỗi cấu hình."""
+    found: List[Tuple[str, str, str]] = []
+    seen = set()
+
+    # 1. Ổ cứng nội bộ & USB Di động
+    internal_disks, usb_disks = _split_storage_items(storage_details)
+    for comp_label, items in (("Ổ cứng", internal_disks), ("USB Di động", usb_disks)):
+        for seg in items:
+            m = re.search(r'\[SN:\s*([^\]]+)\]', seg)
+            if m:
+                sn_raw = m.group(1).strip()
+                if _is_valid_hardware_serial(sn_raw):
+                    key = (comp_label, sn_raw.upper())
+                    if key not in seen:
+                        seen.add(key)
+                        found.append((comp_label, sn_raw.upper(), seg))
+
+    # 2. Màn hình
+    mon_raw = str(monitors_details or "").strip()
+    if mon_raw and not mon_raw.startswith("Không phát hiện"):
+        for seg in mon_raw.split(";"):
+            seg = seg.strip()
+            m = re.search(r'SN:\s*([^,\)\]]+)', seg)
+            if m:
+                sn_raw = m.group(1).strip()
+                if _is_valid_hardware_serial(sn_raw):
+                    key = ("Màn hình", sn_raw.upper())
+                    if key not in seen:
+                        seen.add(key)
+                        found.append(("Màn hình", sn_raw.upper(), seg))
+
+    # 3. RAM (với client >= v1.3.2 có [SN: ...])
+    ram_raw = str(ram_details or "").strip()
+    if "->" in ram_raw:
+        sticks_part = ram_raw.split("->", 1)[1]
+        for seg in sticks_part.split(";"):
+            seg = seg.strip()
+            m = re.search(r'\[SN:\s*([^\]]+)\]', seg)
+            if m:
+                sn_raw = m.group(1).strip()
+                if _is_valid_hardware_serial(sn_raw):
+                    key = ("RAM", sn_raw.upper())
+                    if key not in seen:
+                        seen.add(key)
+                        found.append(("RAM", sn_raw.upper(), seg))
+
+    return found
+
+
+def _restore_and_clean_false_alerts(cursor: sqlite3.Cursor):
+    """Khôi phục thông số thật bị N/A ghi đè trước đó và dọn cảnh báo giả khỏi hardware_history."""
+    # Khôi phục Màn hình thật nếu bị "Không phát hiện..." ghi đè trước đây
+    cursor.execute("""
+    SELECT h.mac_address, h.old_value
+    FROM hardware_history h
+    JOIN computers c ON c.mac_address = h.mac_address
+    WHERE h.component = 'Màn hình'
+      AND h.new_value LIKE 'Không phát hiện%'
+      AND h.old_value NOT LIKE 'Không phát hiện%'
+      AND (c.monitors_details IS NULL OR c.monitors_details LIKE 'Không phát hiện%')
+    ORDER BY h.detected_at DESC
+    """)
+    restored_mon = set()
+    for row in cursor.fetchall():
+        mac = row["mac_address"]
+        if mac not in restored_mon:
+            restored_mon.add(mac)
+            cursor.execute("UPDATE computers SET monitors_details = ? WHERE mac_address = ?", (row["old_value"], mac))
+
+    # Khôi phục Ổ cứng thật nếu bị WMI timeout "Ổ cứng cục bộ (N/A)" ghi đè
+    cursor.execute("""
+    SELECT h.mac_address, h.old_value
+    FROM hardware_history h
+    JOIN computers c ON c.mac_address = h.mac_address
+    WHERE h.component = 'Ổ cứng'
+      AND h.new_value = 'Ổ cứng cục bộ (N/A)'
+      AND h.old_value != 'Ổ cứng cục bộ (N/A)'
+      AND (c.storage_details IS NULL OR c.storage_details = 'Ổ cứng cục bộ (N/A)')
+    ORDER BY h.detected_at DESC
+    """)
+    restored_disk = set()
+    for row in cursor.fetchall():
+        mac = row["mac_address"]
+        if mac not in restored_disk:
+            restored_disk.add(mac)
+            cursor.execute("UPDATE computers SET storage_details = ? WHERE mac_address = ?", (row["old_value"], mac))
+
+    # Khôi phục chi tiết thanh RAM nếu bị WMI timeout ("-> 1.9 GB") ghi đè
+    cursor.execute("""
+    SELECT h.mac_address, h.old_value
+    FROM hardware_history h
+    JOIN computers c ON c.mac_address = h.mac_address
+    WHERE h.component = 'RAM'
+      AND h.old_value LIKE '%-> Thanh %'
+      AND h.new_value NOT LIKE '%-> Thanh %'
+      AND (c.ram_details IS NULL OR c.ram_details NOT LIKE '%-> Thanh %')
+    ORDER BY h.detected_at DESC
+    """)
+    restored_ram = set()
+    for row in cursor.fetchall():
+        mac = row["mac_address"]
+        if mac not in restored_ram:
+            m = re.match(r'^[\d.]+\s*GB\s*\((.+)\)$', str(row["old_value"] or "").strip())
+            if m:
+                restored_ram.add(mac)
+                cursor.execute("UPDATE computers SET ram_details = ? WHERE mac_address = ?", (m.group(1).strip(), mac))
+
+    # Xóa các cảnh báo giả đã phát sinh trước đây
     cursor.execute("""
     DELETE FROM hardware_history
     WHERE component = 'Màn hình'
       AND (old_value LIKE 'Không phát hiện%' OR new_value LIKE 'Không phát hiện%')
     """)
     cursor.execute("""
+    DELETE FROM hardware_history
+    WHERE component = 'Ổ cứng'
+      AND (old_value = 'Ổ cứng cục bộ (N/A)' OR new_value = 'Ổ cứng cục bộ (N/A)')
+    """)
+    cursor.execute("""
+    DELETE FROM hardware_history
+    WHERE component = 'RAM'
+      AND (
+          (old_value LIKE '%-> Thanh %' AND new_value NOT LIKE '%-> Thanh %')
+          OR (new_value LIKE '%-> Thanh %' AND old_value NOT LIKE '%-> Thanh %')
+      )
+    """)
+    cursor.execute("""
     UPDATE computers
     SET hardware_tampered = 0, tamper_details = ''
     WHERE hardware_tampered = 1
-      AND mac_address NOT IN (SELECT DISTINCT mac_address FROM hardware_history)
+      AND mac_address NOT IN (SELECT DISTINCT mac_address FROM hardware_history WHERE is_acknowledged = 0)
     """)
-    conn.commit()
-    conn.close()
+
+
+def _backfill_component_registry(cursor: sqlite3.Cursor):
+    """Đồng bộ baseline serial linh kiện từ bảng computers sang component_registry."""
+    cursor.execute("""
+    SELECT mac_address, hostname, department, user_name, storage_details, monitors_details, ram_details,
+           COALESCE(last_seen, updated_at, created_at) AS seen_ts
+    FROM computers
+    ORDER BY seen_ts ASC
+    """)
+    for row in cursor.fetchall():
+        serials = _extract_component_serials(
+            row["storage_details"], row["monitors_details"], row["ram_details"]
+        )
+        seen_ts = row["seen_ts"] or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for comp_type, sn_upper, desc in serials:
+            cursor.execute("""
+            INSERT INTO component_registry (
+                component_type, serial_number, component_desc,
+                mac_address, hostname, department, user_name, first_seen, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(component_type, serial_number) DO UPDATE SET
+                component_desc = excluded.component_desc,
+                mac_address = excluded.mac_address,
+                hostname = excluded.hostname,
+                department = excluded.department,
+                user_name = excluded.user_name,
+                updated_at = excluded.updated_at
+            """, (
+                comp_type, sn_upper, desc,
+                row["mac_address"], row["hostname"], row["department"], row["user_name"],
+                seen_ts, seen_ts
+            ))
+
+
+def _is_same_physical_machine_alias(
+    cursor: sqlite3.Cursor,
+    other_mac: str,
+    hostname: str,
+    mainboard: str,
+    current_serials: List[Tuple[str, str, str]]
+) -> bool:
+    """Tránh báo nhầm khi 1 máy vật lý đổi qua card mạng khác (VD: LAN <-> Wi-Fi/USB tethering)."""
+    h_cur = str(hostname or "").strip().upper()
+    mb_cur = str(mainboard or "").strip().upper()
+    if not h_cur or not mb_cur:
+        return False
+
+    cursor.execute("""
+    SELECT hostname, mainboard_info, storage_details, monitors_details, ram_details
+    FROM computers WHERE mac_address = ?
+    """, (other_mac,))
+    other = cursor.fetchone()
+    if not other:
+        return False
+
+    if str(other["hostname"] or "").strip().upper() != h_cur:
+        return False
+    if str(other["mainboard_info"] or "").strip().upper() != mb_cur:
+        return False
+
+    other_serials = {
+        (ct, sn)
+        for ct, sn, _ in _extract_component_serials(
+            other["storage_details"], other["monitors_details"], other["ram_details"]
+        )
+    }
+    shared_types = {ct for ct, sn, _ in current_serials if (ct, sn) in other_serials}
+    return len(shared_types) >= 2
 
 
 def upsert_computer(data: Dict[str, Any]) -> int:
@@ -201,19 +479,57 @@ def upsert_computer(data: Dict[str, Any]) -> int:
         hardware_tampered = existing["hardware_tampered"] or 0
         tamper_details = existing["tamper_details"] or ""
 
-        # So sánh RAM
+        # So sánh RAM (bỏ qua nếu rớt WMI timeout mất chi tiết thanh RAM hoặc nâng cấp v1.3.2 thêm [SN:])
         old_ram = str(existing["ram_details"] or "").strip()
         new_ram = str(data.get("ram_details") or "").strip()
         old_ram_gb = float(existing["ram_total_gb"] or 0)
         new_ram_gb = float(data.get("ram_total_gb") or 0)
-        if (old_ram and new_ram and old_ram != new_ram) or (old_ram_gb > 0 and new_ram_gb > 0 and abs(old_ram_gb - new_ram_gb) >= 0.8):
+        old_has_sticks = "-> Thanh " in old_ram
+        new_has_sticks = "-> Thanh " in new_ram
+        same_gb = abs(old_ram_gb - new_ram_gb) < 0.8
+
+        if old_has_sticks and not new_has_sticks and same_gb:
+            # WMI timeout mất chi tiết thanh -> giữ nguyên dữ liệu cũ, không báo giả
+            data["ram_details"] = old_ram
+            if old_ram_gb > 0:
+                data["ram_total_gb"] = old_ram_gb
+        elif not old_has_sticks and new_has_sticks and same_gb:
+            # Máy cũ trước đó bị thiếu chi tiết thanh, nay quét đủ -> cập nhật êm
+            pass
+        elif "[SN:" not in old_ram and "[SN:" in new_ram and _strip_ram_sn(old_ram) == _strip_ram_sn(new_ram) and same_gb:
+            # Nâng cấp client lên v1.3.2 bổ sung Serial RAM lần đầu -> cập nhật êm
+            pass
+        elif (old_ram and new_ram and old_ram != new_ram) or (old_ram_gb > 0 and new_ram_gb > 0 and not same_gb):
             changes.append(("RAM", f"{old_ram_gb} GB ({old_ram})", f"{new_ram_gb} GB ({new_ram})"))
 
-        # So sánh Ổ cứng
+        # So sánh Ổ cứng nội bộ và Ổ cứng di động / USB tách biệt
         old_disk = str(existing["storage_details"] or "").strip()
         new_disk = str(data.get("storage_details") or "").strip()
-        if old_disk and new_disk and old_disk != new_disk:
-            changes.append(("Ổ cứng", old_disk, new_disk))
+        if (not new_disk or new_disk == "Ổ cứng cục bộ (N/A)") and old_disk and old_disk != "Ổ cứng cục bộ (N/A)":
+            # WMI timeout trả về N/A -> giữ lại ổ cứng thật cũ, không báo giả
+            data["storage_details"] = old_disk
+        elif old_disk == "Ổ cứng cục bộ (N/A)" and new_disk and new_disk != "Ổ cứng cục bộ (N/A)":
+            # Khôi phục từ N/A trước đó -> cập nhật êm
+            pass
+        elif old_disk and new_disk and old_disk != new_disk:
+            old_internal, old_usb = _split_storage_items(old_disk)
+            new_internal, new_usb = _split_storage_items(new_disk)
+            if old_internal and new_internal and old_internal != new_internal:
+                changes.append(("Ổ cứng", "; ".join(old_internal), "; ".join(new_internal)))
+            if old_usb != new_usb:
+                cursor.execute("""
+                INSERT INTO hardware_history (mac_address, hostname, department, user_name, component, old_value, new_value, detected_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    mac_clean,
+                    data.get("hostname", "") or existing["hostname"],
+                    data.get("department", "") or existing["department"],
+                    data.get("user_name", "") or existing["user_name"],
+                    "Ổ cứng di động / USB",
+                    "; ".join(old_usb) if old_usb else "Không gắn USB / Ổ di động",
+                    "; ".join(new_usb) if new_usb else "Đã tháo USB / Ổ di động",
+                    now_str
+                ))
 
         # So sánh CPU
         old_cpu = str(existing["cpu_info"] or "").strip()
@@ -232,30 +548,69 @@ def upsert_computer(data: Dict[str, Any]) -> int:
             # Giữ lại thông tin màn hình thật cũ thay vì ghi đè bằng "Không phát hiện..."
             data["monitors_details"] = old_mon
 
-        if changes:
-            hardware_tampered = 1
-            tamper_details = "; ".join([f"{c[0]}: Cũ [{c[1]}] -> Mới [{c[2]}]" for c in changes])
-            for comp, old_val, new_val in changes:
-                cursor.execute("""
-                INSERT INTO hardware_history (mac_address, hostname, department, user_name, component, old_value, new_value, detected_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    mac_clean,
-                    data.get("hostname", "") or existing["hostname"],
-                    data.get("department", "") or existing["department"],
-                    data.get("user_name", "") or existing["user_name"],
-                    comp,
-                    old_val,
-                    new_val,
-                    now_str
-                ))
-
-    # 2. Ghi nhận sự kiện khởi động máy vào power_logs
+    # 1b. Truy vết chéo Serial linh kiện giữa các máy tính (Bắt tận tay cắm từ máy A sang máy B)
     boot_time = data.get("boot_time", "")
     logged_in_user = data.get("logged_in_user", "")
     dept = data.get("department", "") or (existing["department"] if existing else "")
     u_name = data.get("user_name", "") or (existing["user_name"] if existing else "")
     h_name = data.get("hostname", "") or (existing["hostname"] if existing else "")
+    mb_info = data.get("mainboard_info", "") or (existing["mainboard_info"] if existing else "")
+    current_serials = _extract_component_serials(
+        data.get("storage_details", ""),
+        data.get("monitors_details", ""),
+        data.get("ram_details", "")
+    )
+    for comp_type, sn_upper, desc in current_serials:
+        cursor.execute("""
+        SELECT mac_address, hostname, department, user_name, component_desc
+        FROM component_registry
+        WHERE component_type = ? AND serial_number = ?
+        """, (comp_type, sn_upper))
+        owner = cursor.fetchone()
+        if owner and owner["mac_address"] != mac_clean:
+            if not _is_same_physical_machine_alias(cursor, owner["mac_address"], h_name, mb_info, current_serials):
+                prev_host = owner["hostname"] or owner["mac_address"]
+                prev_dept = owner["department"] or "Chưa rõ khoa"
+                prev_user = owner["user_name"] or owner["mac_address"]
+                prev_desc = owner["component_desc"] or f"SN: {sn_upper}"
+                changes.append((
+                    f"Tráo chéo {comp_type}",
+                    f"Từ máy {prev_host} [{prev_dept} - {prev_user}] | {prev_desc}",
+                    f"Cắm sang {h_name or mac_clean} [{dept or 'Chưa rõ khoa'} - {u_name or mac_clean}] | {desc}"
+                ))
+        cursor.execute("""
+        INSERT INTO component_registry (
+            component_type, serial_number, component_desc,
+            mac_address, hostname, department, user_name, first_seen, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(component_type, serial_number) DO UPDATE SET
+            component_desc = excluded.component_desc,
+            mac_address = excluded.mac_address,
+            hostname = excluded.hostname,
+            department = excluded.department,
+            user_name = excluded.user_name,
+            updated_at = excluded.updated_at
+        """, (comp_type, sn_upper, desc, mac_clean, h_name, dept, u_name, now_str, now_str))
+
+    if changes:
+        hardware_tampered = 1
+        tamper_details = "; ".join([f"{c[0]}: Cũ [{c[1]}] -> Mới [{c[2]}]" for c in changes])
+        for comp, old_val, new_val in changes:
+            cursor.execute("""
+            INSERT INTO hardware_history (mac_address, hostname, department, user_name, component, old_value, new_value, detected_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                mac_clean,
+                h_name,
+                dept,
+                u_name,
+                comp,
+                old_val,
+                new_val,
+                now_str
+            ))
+
+    # 2. Ghi nhận sự kiện khởi động máy vào power_logs
 
     cursor.execute("""
     INSERT INTO power_logs (mac_address, hostname, department, user_name, logged_in_user, event_type, event_time, notes)
@@ -528,7 +883,7 @@ def get_statistics() -> Dict[str, Any]:
 
     cursor.execute("SELECT value FROM system_settings WHERE key = 'target_client_version'")
     trow = cursor.fetchone()
-    latest_ver = (trow["value"] if trow and trow["value"] else "1.3.1").strip()
+    latest_ver = (trow["value"] if trow and trow["value"] else "1.3.2").strip()
 
     cursor.execute("""
     SELECT COALESCE(NULLIF(client_version, ''), '1.3.0') AS version, COUNT(*) AS count
@@ -763,10 +1118,17 @@ def get_hardware_alerts(limit: int = 50) -> List[Dict[str, Any]]:
 
 
 def ack_hardware_alert(alert_id: int) -> bool:
-    """Xác nhận đã xử lý cảnh báo phần cứng."""
+    """Xác nhận đã xử lý cảnh báo phần cứng và gỡ cờ đỏ trên máy nếu không còn cảnh báo mới."""
     conn = get_db_connection()
     cursor = conn.cursor()
+    cursor.execute("SELECT mac_address FROM hardware_history WHERE id = ?", (alert_id,))
+    row = cursor.fetchone()
     cursor.execute("UPDATE hardware_history SET is_acknowledged = 1 WHERE id = ?", (alert_id,))
+    if row:
+        mac = row["mac_address"]
+        cursor.execute("SELECT 1 FROM hardware_history WHERE mac_address = ? AND is_acknowledged = 0 LIMIT 1", (mac,))
+        if not cursor.fetchone():
+            cursor.execute("UPDATE computers SET hardware_tampered = 0, tamper_details = '' WHERE mac_address = ?", (mac,))
     conn.commit()
     conn.close()
     return True

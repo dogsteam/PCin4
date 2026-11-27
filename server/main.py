@@ -127,7 +127,7 @@ class RemoteUpdatePayload(BaseModel):
 
 
 class RemoteUpdateAllPayload(BaseModel):
-    target_version: str = "1.3.1"
+    target_version: str = "1.3.2"
     url: Optional[str] = ""
 
 
@@ -403,7 +403,7 @@ def _dispatch_update_to_devices(devices: list, update_file_url: str, sha256_hash
 
 @app.post("/api/remote/update-all", tags=["Điều khiển từ xa"])
 def remote_update_all(req: RemoteUpdateAllPayload):
-    target_ver = (req.target_version or "1.3.1").strip()
+    target_ver = (req.target_version or "1.3.2").strip()
     update_file_url = (req.url or "").strip() or "http://10.10.12.188:8000/in4.exe"
     sha256_hash = _get_local_in4_sha256() if update_file_url.rstrip("/").endswith("/in4.exe") else ""
 
@@ -1072,7 +1072,7 @@ def web_dashboard():
                                     <i class="bi bi-shield-exclamation text-danger me-2"></i>LỊCH SỬ THAY ĐỔI & CẢNH BÁO TRÁO ĐỔI PHẦN CỨNG
                                 </h5>
                                 <div class="text-muted small">
-                                    Hệ thống tự động so sánh cấu hình phần cứng sau mỗi lần bật máy tính. Cảnh báo ngay khi phát hiện RAM bị tháo, ổ cứng bị đổi serial, CPU hoặc màn hình bị tráo.
+                                    Hệ thống tự động đối chiếu cấu hình và truy vết chéo Serial linh kiện toàn viện: cảnh báo khi RAM/Ổ cứng/CPU/Màn hình bị thay đổi, ghi nhận thiết bị USB/Ổ di động, và phát hiện tức thì nếu linh kiện (Serial) từ máy này bị rút cắm sang máy khác.
                                 </div>
                             </div>
                             <button class="btn btn-sm btn-outline-secondary" onclick="loadHardwareAlerts()">
@@ -1269,7 +1269,7 @@ def web_dashboard():
             let updateModalObj = null;
             let pingModalObj = null;
             let currentPingTarget = null;
-            let latestClientVersion = '1.3.1';
+            let latestClientVersion = '1.3.2';
             let currentFilteredDevices = [];
 
             document.addEventListener('DOMContentLoaded', () => {
@@ -1388,15 +1388,23 @@ def web_dashboard():
                             '<span class="text-muted small">✓ Đã xác nhận</span>' : 
                             `<button class="btn btn-sm btn-outline-success fw-bold" onclick="ackHardwareAlert(${a.id})"><i class="bi bi-check-lg me-1"></i>Xác nhận</button>`;
 
+                        const compName = a.component || '';
+                        let compBadgeClass = 'bg-dark text-warning';
+                        if (compName.startsWith('Tráo chéo')) {
+                            compBadgeClass = 'bg-danger text-white';
+                        } else if (compName.includes('USB')) {
+                            compBadgeClass = 'bg-info text-dark';
+                        }
+
                         return `
-                        <tr class="${a.is_acknowledged ? '' : 'table-warning'}">
+                        <tr class="${a.is_acknowledged ? '' : (compName.startsWith('Tráo chéo') ? 'table-danger' : 'table-warning')}">
                             <td><small>${escapeHtml(a.detected_at)}</small><br>${statusBadge}</td>
                             <td><div class="fw-bold text-primary">${escapeHtml(a.hostname)}</div><small class="text-muted">${escapeHtml(a.mac_address)}</small></td>
                             <td><span class="badge bg-light text-dark border">${escapeHtml(a.department || 'N/A')}</span></td>
                             <td><div class="fw-bold">${escapeHtml(a.user_name || 'N/A')}</div></td>
-                            <td><span class="badge bg-dark text-warning fs-6">${escapeHtml(a.component)}</span></td>
-                            <td><div class="small text-danger text-break" style="max-width:200px;">${escapeHtml(a.old_value)}</div></td>
-                            <td><div class="small text-success text-break" style="max-width:200px;">${escapeHtml(a.new_value)}</div></td>
+                            <td><span class="badge ${compBadgeClass} fs-6">${escapeHtml(compName)}</span></td>
+                            <td><div class="small text-danger text-break" style="max-width:260px;">${escapeHtml(a.old_value)}</div></td>
+                            <td><div class="small text-success text-break" style="max-width:260px;">${escapeHtml(a.new_value)}</div></td>
                             <td class="text-center">${actionBtn}</td>
                         </tr>
                         `;
@@ -1861,7 +1869,7 @@ def web_dashboard():
             }
 
             async function updateAllClients() {
-                const targetVer = prompt('Nhập phiên bản Client mục tiêu (Desired State) muốn phát hành cho toàn viện:', '1.3.1');
+                const targetVer = prompt('Nhập phiên bản Client mục tiêu (Desired State) muốn phát hành cho toàn viện:', '1.3.2');
                 if (!targetVer || !targetVer.trim()) return;
                 try {
                     const res = await fetch('/api/remote/update-all', {

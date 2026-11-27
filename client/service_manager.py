@@ -33,7 +33,7 @@ from typing import Optional
 
 DEFAULT_SERVER_URL = "http://10.10.12.188:8000"
 CLIENT_AGENT_PORT = 8005
-CLIENT_VERSION = "1.3.1"
+CLIENT_VERSION = "1.3.2"
 DEFAULT_HEARTBEAT_INTERVAL = 300  # 5 phút/lần (tối ưu cho quy mô 800 máy)
 
 _MUTEX_HANDLE = None
