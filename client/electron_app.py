@@ -18,7 +18,6 @@ import urllib.error
 import sqlite3
 import traceback
 from datetime import datetime
-import webview
 
 import hardware_collector
 
@@ -1149,6 +1148,7 @@ def main():
                     except Exception: pass
         html_ready = html_ready.replace("__FAVICON_BASE64__", icon_b64)
 
+        import webview
         window = webview.create_window(
             title="IN4 // HARDWARE RECON & HOSPITAL ASSET SYSTEM",
             html=html_ready,
