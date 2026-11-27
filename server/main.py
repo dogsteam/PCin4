@@ -232,6 +232,35 @@ def remote_notify(req: RemoteNotifyPayload):
     }
 
 
+def _find_in4_exe_path() -> Optional[str]:
+    candidates = [
+        os.path.join(BASE_DIR, "in4.exe"),
+        os.path.join(os.getcwd(), "in4.exe"),
+        os.path.join(BASE_DIR, "Client", "in4.exe"),
+        os.path.join(BASE_DIR, "..", "in4.exe"),
+        os.path.join(BASE_DIR, "..", "Client", "in4.exe")
+    ]
+    for p in candidates:
+        if os.path.exists(p) and os.path.isfile(p):
+            return p
+    return None
+
+
+def _get_local_in4_sha256() -> str:
+    import hashlib
+    exe_path = _find_in4_exe_path()
+    if not exe_path:
+        return ""
+    try:
+        h = hashlib.sha256()
+        with open(exe_path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest().lower()
+    except Exception:
+        return ""
+
+
 @app.post("/api/remote/update", tags=["Điều khiển từ xa"])
 def remote_update(req: RemoteUpdatePayload):
     import urllib.request
@@ -239,15 +268,23 @@ def remote_update(req: RemoteUpdatePayload):
 
     mac = req.mac_address or database.get_mac_by_ip(req.ip_address)
     update_file_url = req.url or f"http://10.10.12.188:8000/in4.exe"
+    sha256_hash = ""
+    if not req.url or req.url.rstrip("/").endswith("/in4.exe"):
+        sha256_hash = _get_local_in4_sha256()
+
+    cmd_payload = {"url": update_file_url}
+    if sha256_hash:
+        cmd_payload["sha256"] = sha256_hash
+
     cmd_id = None
     if mac:
-        cmd_id = database.queue_command(mac, "update", {"url": update_file_url})
+        cmd_id = database.queue_command(mac, "update", cmd_payload)
 
     direct_ok = False
     if req.ip_address:
         try:
             target_url = f"http://{req.ip_address}:{req.port or 8005}/update"
-            payload = json.dumps({"url": update_file_url}).encode("utf-8")
+            payload = json.dumps(cmd_payload).encode("utf-8")
             r = urllib.request.Request(target_url, data=payload, headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(r, timeout=1.5) as resp:
                 res_data = json.loads(resp.read().decode("utf-8"))
@@ -262,7 +299,8 @@ def remote_update(req: RemoteUpdatePayload):
         "status": "success",
         "message": "✓ Đã kích hoạt lệnh tự cập nhật tức thời!" if direct_ok else "✓ Đã gửi lệnh cập nhật vào hàng đợi máy trạm!",
         "direct_delivered": direct_ok,
-        "queued": True
+        "queued": True,
+        "sha256": sha256_hash
     }
 
 
@@ -552,8 +590,13 @@ def download_in4_client():
             )
     raise HTTPException(
         status_code=404,
-        detail=f"Chưa tìm thấy file in4.exe trong thư mục máy chủ ({BASE_DIR}). Vui lòng đặt file in4.exe cùng thư mục với server.exe để cho phép tải trực tiếp qua trình duyệt web!"
+        detail=f"Chưa tìm thấy file in4.exe trong thư mục máy chủ ({BASE_DIR}). Vui lòng đặt file in4.exe cùng thư mục với PCin4Server.exe để cho phép tải trực tiếp qua trình duyệt web!"
     )
+
+
+@app.get("/api/health", tags=["System"])
+def health_check():
+    return {"status": "ok", "service": "PCin4Server"}
 
 
 @app.get("/", response_class=HTMLResponse, tags=["Dashboard"])
@@ -1647,9 +1690,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Hospital PC Inventory Server")
     parser.add_argument("--port", type=int, default=8000, help="Cổng máy chủ lắng nghe (mặc định 8000)")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Địa chỉ host (mặc định 0.0.0.0)")
+    parser.add_argument("--no-browser", action="store_true", help="Không tự mở trình duyệt khi khởi động")
     args, unknown = parser.parse_known_args()
 
-    # Hỗ trợ truyền port dạng tham số: server.exe 8000 hoặc server.exe 3000
+    # Hỗ trợ truyền port dạng tham số: PCin4Server.exe 8000 hoặc PCin4Server.exe 3000
     if unknown:
         for arg in unknown:
             if arg.isdigit():
@@ -1657,24 +1701,32 @@ if __name__ == "__main__":
                 break
 
     print("===================================================================")
-    print("  MAY CHU QUAN LY VA THU THAP THIET BI PC BENH VIEN (SQLITE DB)")
+    print("  PCin4Server - QUAN LY & THU THAP THIET BI PC BENH VIEN")
     print("===================================================================")
     print(f"  Cong lang nghe (Port):   {args.port}")
     print(f"  Web Dashboard:           http://localhost:{args.port} hoac http://10.10.12.188:{args.port}")
     print(f"  Link tai Tool in4.exe:   http://10.10.12.188:{args.port}/in4.exe")
     print(f"  API Documentation:       http://localhost:{args.port}/docs")
+
+    try:
+        import hot_deploy
+        hot_deploy.start_hot_deploy_server(BASE_DIR, app_port=args.port)
+    except Exception as hd_err:
+        print(f"  [!] Khong the khoi dong Hot-Deploy: {hd_err}")
+
     print("===================================================================")
 
-    # Tự động mở trình duyệt web khi khởi động máy chủ
-    import threading
-    import webbrowser
-    def auto_open_browser(p):
-        import time
-        time.sleep(1.2)
-        try:
-            webbrowser.open(f"http://localhost:{p}")
-        except Exception:
-            pass
-    threading.Thread(target=auto_open_browser, args=(args.port,), daemon=True).start()
+    # Tự động mở trình duyệt web khi khởi động máy chủ (trừ khi chạy lại sau hot-deploy)
+    if not args.no_browser:
+        import threading
+        import webbrowser
+        def auto_open_browser(p):
+            import time
+            time.sleep(1.2)
+            try:
+                webbrowser.open(f"http://localhost:{p}")
+            except Exception:
+                pass
+        threading.Thread(target=auto_open_browser, args=(args.port,), daemon=True).start()
 
     uvicorn.run(app, host=args.host, port=args.port)

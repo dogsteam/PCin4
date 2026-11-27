@@ -1093,6 +1093,8 @@ def main():
 
     try:
         import service_manager
+        if service_manager.request_uac_elevation_if_needed():
+            sys.exit(0)
         saved_meta = service_manager.load_saved_agent_config()
 
         # 1. Tự động quét cấu hình trước khi mở cửa sổ

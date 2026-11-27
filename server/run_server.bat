@@ -17,7 +17,9 @@ echo.
 
 cd /d "%~dp0"
 
-if exist server.exe (
+if exist PCin4Server.exe (
+    PCin4Server.exe %*
+) else if exist server.exe (
     server.exe %*
 ) else (
     python main.py %*

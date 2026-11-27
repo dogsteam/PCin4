@@ -11,6 +11,7 @@ import os
 import sys
 import json
 import shutil
+import hashlib
 import subprocess
 import winreg
 import time
@@ -137,16 +138,123 @@ def save_agent_config(data: dict):
         log_sync(f"Lỗi lưu agent_config.json: {e}")
 
 
+def is_user_admin() -> bool:
+    """Kiểm tra tiến trình hiện tại có đang chạy với quyền Administrator hay không."""
+    try:
+        import ctypes
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        return False
+
+
+def request_uac_elevation_if_needed() -> bool:
+    """
+    Nếu đang chạy chế độ giao diện cài đặt mà chưa có quyền Admin,
+    hiện hộp thoại UAC xin nâng quyền 1 lần duy nhất.
+    - Nếu đã là Admin sẵn: trả về False ngay (không hiện hộp thoại).
+    - Nếu người dùng đồng ý UAC: chạy tiến trình mới với quyền Admin và trả về True để tiến trình cũ thoát.
+    - Nếu người dùng từ chối hoặc lỗi: trả về False để app vẫn chạy tiếp bình thường dưới quyền User.
+    """
+    if sys.platform != "win32":
+        return False
+    if "--no-uac" in sys.argv or "--silent" in sys.argv:
+        return False
+    if is_user_admin():
+        return False
+
+    try:
+        import ctypes
+        if getattr(sys, "frozen", False):
+            exe = sys.executable
+            extra_args = [a for a in sys.argv[1:] if a != "--no-uac"]
+        else:
+            exe = sys.executable
+            script_path = os.path.abspath(sys.argv[0])
+            extra_args = [script_path] + [a for a in sys.argv[1:] if a != "--no-uac"]
+
+        extra_args.append("--no-uac")
+        params = subprocess.list2cmdline(extra_args)
+        ret = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
+        if ret > 32:
+            return True
+    except Exception as e:
+        log_sync(f"Không thể nâng quyền UAC (tiếp tục chạy User thường): {e}")
+    return False
+
+
+def ensure_defender_exclusion(target_dir: str = None) -> bool:
+    """
+    Thêm thư mục Agent vào danh sách loại trừ (ExclusionPath) của Windows Defender.
+    - Nếu đang chạy với quyền Admin: thực thi thành công và tạo marker .defender_excluded.
+    - Nếu chạy với quyền User thường: fail an toàn, không làm gián đoạn ứng dụng.
+    """
+    if sys.platform != "win32":
+        return False
+
+    agent_dir = target_dir or get_agent_dir()
+    marker_file = os.path.join(agent_dir, ".defender_excluded")
+    if os.path.exists(marker_file):
+        return True
+
+    if not is_user_admin():
+        log_sync("⚠ Không có quyền Admin nên bỏ qua bước thêm Windows Defender Exclusion.")
+        return False
+
+    try:
+        escaped_dir = agent_dir.replace("'", "''")
+        ps_cmd = f"Add-MpPreference -ExclusionPath '{escaped_dir}'"
+        CREATE_NO_WINDOW = 0x08000000
+        res = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=CREATE_NO_WINDOW
+        )
+        if res.returncode == 0:
+            try:
+                with open(marker_file, "w", encoding="utf-8") as f:
+                    f.write(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            except Exception:
+                pass
+            log_sync(f"✓ Đã thêm thư mục vào Windows Defender Exclusion: {agent_dir}")
+            return True
+        else:
+            log_sync(f"⚠ Add-MpPreference trả mã {res.returncode}: {(res.stderr or '').strip()}")
+    except Exception as e:
+        log_sync(f"⚠ Lỗi ensure_defender_exclusion: {e}")
+    return False
+
+
+def cleanup_old_update_files():
+    """Dọn dẹp file .old / .tmp còn sót lại sau khi tự cập nhật thành công."""
+    try:
+        agent_dir = get_agent_dir()
+        for fname in ("in4.old", "in4_new.tmp", "update_runner.bat"):
+            fpath = os.path.join(agent_dir, fname)
+            if os.path.exists(fpath):
+                try:
+                    os.remove(fpath)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
 def install_auto_start(metadata: dict = None) -> bool:
     """
     Cài đặt Agent tự khởi động cùng Windows:
-    1. Sao chép in4.exe vào vị trí hệ thống cố định
-    2. Lưu cấu hình vị trí / mã vạch / khoa phòng
-    3. Đăng ký Windows Task Scheduler (OnLogon) và Registry Run
+    1. Thêm thư mục Agent vào Windows Defender Exclusion (nếu có quyền Admin)
+    2. Sao chép in4.exe vào vị trí hệ thống cố định
+    3. Lưu cấu hình vị trí / mã vạch / khoa phòng
+    4. Đăng ký Windows Registry Run & mở Firewall port
     """
     try:
         agent_dir = get_agent_dir()
         target_exe = os.path.join(agent_dir, "in4.exe")
+
+        # 0. Thêm Exclusion trước khi copy exe vào thư mục Agent
+        ensure_defender_exclusion(agent_dir)
 
         # 1. Sao chép in4.exe vào thư mục cố định
         current_exe = os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__)
@@ -227,39 +335,73 @@ def get_boot_info() -> tuple:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 0.0
 
 
-def perform_self_update(url: str) -> bool:
-    """Tự động tải bản in4.exe mới từ máy chủ và cập nhật không cần kỹ thuật viên."""
+def _calc_file_sha256(file_path: str) -> str:
+    h = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest().lower()
+
+
+def perform_self_update(url: str, expected_sha256: str = "") -> bool:
+    """
+    Tự động tải bản in4.exe mới từ máy chủ và cập nhật theo cơ chế Rename-in-place:
+    - Không sinh file .bat, không gọi cmd.exe / taskkill (tránh bị Antivirus gắn cờ nhầm).
+    - Kiểm tra dung lượng >= 4MB và đối chiếu SHA256 (nếu server cung cấp).
+    """
     log_sync(f">>> Bắt đầu tự động cập nhật từ {url}...")
     agent_dir = get_agent_dir()
     target_exe = os.path.join(agent_dir, "in4.exe")
+    old_exe = os.path.join(agent_dir, "in4.old")
     temp_exe = os.path.join(agent_dir, "in4_new.tmp")
-    updater_bat = os.path.join(agent_dir, "update_runner.bat")
 
     try:
         urllib.request.urlretrieve(url, temp_exe)
         if not os.path.exists(temp_exe) or os.path.getsize(temp_exe) < 4 * 1024 * 1024:
             log_sync("✗ File tải về không hợp lệ (< 4MB)!")
+            if os.path.exists(temp_exe):
+                os.remove(temp_exe)
             return False
 
-        bat_content = f"""@echo off
-timeout /t 2 /nobreak >nul
-taskkill /F /IM in4.exe /T 2>nul
-move /y "{temp_exe}" "{target_exe}"
-start "" "{target_exe}" --silent
-del "%~f0"
-"""
-        with open(updater_bat, "w", encoding="utf-8") as f:
-            f.write(bat_content)
+        if expected_sha256:
+            actual_sha256 = _calc_file_sha256(temp_exe)
+            if actual_sha256 != expected_sha256.strip().lower():
+                log_sync(f"✗ Sai mã kiểm tra SHA256! Kỳ vọng: {expected_sha256}, thực tế: {actual_sha256}")
+                os.remove(temp_exe)
+                return False
+            log_sync(f"✓ Xác thực SHA256 hợp lệ ({actual_sha256[:12]}...).")
+
+        if os.path.exists(old_exe):
+            try:
+                os.remove(old_exe)
+            except Exception as rm_err:
+                log_sync(f"⚠ Không thể xóa in4.old cũ: {rm_err}")
+
+        # Windows cho phép đổi tên file .exe đang chạy sang .old trước khi đặt bản mới vào
+        renamed_old = False
+        if os.path.exists(target_exe):
+            os.replace(target_exe, old_exe)
+            renamed_old = True
+
+        try:
+            os.replace(temp_exe, target_exe)
+        except Exception as swap_err:
+            if renamed_old and os.path.exists(old_exe) and not os.path.exists(target_exe):
+                try:
+                    os.replace(old_exe, target_exe)
+                except Exception:
+                    pass
+            raise swap_err
 
         DETACHED_PROCESS = 0x00000008
         CREATE_NO_WINDOW = 0x08000000
         subprocess.Popen(
-            ["cmd.exe", "/c", updater_bat],
+            [target_exe, "--silent"],
             creationflags=DETACHED_PROCESS | CREATE_NO_WINDOW,
             close_fds=True
         )
-        log_sync("✓ Đã kích hoạt kịch bản tự cập nhật thành công!")
-        sys.exit(0)
+        log_sync("✓ Đã thay thế in4.exe (Rename-in-place) và khởi động phiên bản mới!")
+        os._exit(0)
     except Exception as e:
         log_sync(f"Lỗi perform_self_update: {e}")
         return False
@@ -325,7 +467,8 @@ class ClientRemoteHandler(BaseHTTPRequestHandler):
 
         elif path == "/update":
             update_url = params.get("url", [f"{DEFAULT_SERVER_URL}/in4.exe"])[0]
-            threading.Thread(target=lambda: perform_self_update(update_url), daemon=True).start()
+            expected_sha = params.get("sha256", [""])[0]
+            threading.Thread(target=lambda: perform_self_update(update_url, expected_sha), daemon=True).start()
             self.send_json_response(200, {"status": "success", "message": f"Đã tiếp nhận lệnh tự cập nhật từ {update_url}."})
 
         else:
@@ -352,7 +495,8 @@ class ClientRemoteHandler(BaseHTTPRequestHandler):
 
         elif path == "/update":
             update_url = data.get("url", f"{DEFAULT_SERVER_URL}/in4.exe")
-            threading.Thread(target=lambda: perform_self_update(update_url), daemon=True).start()
+            expected_sha = data.get("sha256", "")
+            threading.Thread(target=lambda: perform_self_update(update_url, expected_sha), daemon=True).start()
             self.send_json_response(200, {"status": "success", "message": f"Đã tiếp nhận lệnh tự cập nhật từ {update_url}."})
         else:
             self.send_json_response(404, {"error": "Not Found"})
@@ -467,8 +611,9 @@ def send_heartbeat(mac: str, ip: str, server_url: str):
                     ack_server_command(cmd_id, server_url)
                 elif cmd_type == "update":
                     update_url = pl.get("url") or f"{server_url.rstrip('/')}/in4.exe"
+                    expected_sha = pl.get("sha256", "")
                     ack_server_command(cmd_id, server_url)
-                    perform_self_update(update_url)
+                    perform_self_update(update_url, expected_sha)
     except Exception:
         pass
 
@@ -517,6 +662,11 @@ def run_silent_background_agent():
 
     log_sync("==================================================")
     log_sync(">>> IN4 Silent Agent đã khởi động cùng Windows...")
+
+    # 0. Dọn file .old sau update & đảm bảo Defender Exclusion nếu đang có quyền Admin
+    time.sleep(1.5)
+    cleanup_old_update_files()
+    ensure_defender_exclusion()
 
     # 1. Mở ngay cổng lắng nghe từ xa 8005 (cho phép nhận thông báo / update từ server)
     start_client_remote_server(CLIENT_AGENT_PORT)
