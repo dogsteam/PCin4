@@ -954,6 +954,7 @@ class BridgeApi:
                         "server_url": server_url
                     }
                     service_manager.install_auto_start(install_payload)
+                    service_manager.spawn_background_process()
                 except Exception as inst_err:
                     log_error(f"Lỗi install_auto_start: {inst_err}")
 
@@ -1158,6 +1159,20 @@ def main():
             resizable=True,
             background_color="#07090e"
         )
+
+        def _on_closing():
+            try:
+                import service_manager
+                final_data = getattr(api, "latest_form_data", {}) or {}
+                service_manager.install_auto_start(final_data)
+                service_manager.spawn_background_process()
+            except Exception as closing_err:
+                log_error(f"Lỗi on_closing: {closing_err}")
+
+        try:
+            window.events.closing += _on_closing
+        except Exception:
+            pass
 
         webview.start()
 

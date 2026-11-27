@@ -280,8 +280,19 @@ def install_auto_start(metadata: dict = None) -> bool:
             if current_exe.lower() != target_exe.lower():
                 try:
                     shutil.copy2(current_exe, target_exe)
-                except Exception as copy_err:
-                    log_sync(f"Lỗi sao chép exe: {copy_err}")
+                except Exception:
+                    try:
+                        old_bak = os.path.join(agent_dir, "in4.old")
+                        if os.path.exists(old_bak):
+                            try:
+                                os.remove(old_bak)
+                            except Exception:
+                                pass
+                        if os.path.exists(target_exe):
+                            os.replace(target_exe, old_bak)
+                        shutil.copy2(current_exe, target_exe)
+                    except Exception as copy_err:
+                        log_sync(f"Lỗi sao chép exe: {copy_err}")
 
         # 2. Lưu thông tin metadata
         if metadata:
